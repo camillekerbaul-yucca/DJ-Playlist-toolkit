@@ -7,9 +7,19 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
     permissions:
       contents: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            args: ''
+          - os: macos-latest
+            args: '--target universal-apple-darwin'
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -22,6 +32,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Cache Rust
         uses: swatinem/rust-cache@v2
@@ -41,8 +53,10 @@ jobs:
           releaseBody: |
             ## Installation
 
-            Télécharge **sldl-dj-toolkit_x64-setup.exe** ci-dessous et lance l'installateur.
+            **Windows** — télécharge `sldl-dj-toolkit_x64-setup.exe`
+            **macOS** — télécharge `sldl-dj-toolkit_universal.dmg`
 
             sldl et ffmpeg sont téléchargés automatiquement au premier lancement.
           releaseDraft: false
           prerelease: false
+          args: ${{ matrix.args }}
