@@ -10,8 +10,11 @@ Built with [Tauri](https://tauri.app) (Rust + React).
 
 Download the latest installer from the [Releases](../../releases/latest) page:
 
-- **sldl-dj-toolkit_x64-setup.exe** — recommended
-- **sldl-dj-toolkit_x64_en-US.msi** — alternative
+| Platform | File |
+|----------|------|
+| Windows | `sldl-dj-toolkit_x64-setup.exe` (recommended) |
+| Windows | `sldl-dj-toolkit_x64_en-US.msi` (alternative) |
+| macOS (Intel + Apple Silicon) | `sldl-dj-toolkit_universal.dmg` |
 
 **sldl** and **ffmpeg** are downloaded and installed automatically on first launch. No manual setup required.
 
