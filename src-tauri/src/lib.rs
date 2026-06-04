@@ -431,7 +431,7 @@ async fn convert_to_aiff(app: AppHandle, state: State<'_, SldlProcess>, dir: Str
             .args([
                 "-loglevel", "warning",
                 "-i", &file.to_string_lossy(),
-                "-c:a", "pcm_s16be", "-f", "aiff", "-y",
+                "-c:a", "pcm_s16be", "-ar", "44100", "-f", "aiff", "-y",
                 &aiff.to_string_lossy(),
             ])
             .stdin(std::process::Stdio::null())
