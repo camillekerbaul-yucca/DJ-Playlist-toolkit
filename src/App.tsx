@@ -197,6 +197,37 @@ function TrackList({ tracks, onToggle, onToggleAll }: { tracks: Track[]; onToggl
   );
 }
 
+// sldl (stdout piped) prints one line per track state change; count the final ones.
+function downloadProgress(logs: string[], fallbackTotal: number) {
+  let total = fallbackTotal, ok = 0, failed = 0;
+  for (const line of logs) {
+    const m = /^Downloading (\d+) tracks/.exec(line);
+    if (m) total = Number(m[1]);
+    else if (/^Succeeded/.test(line)) ok++;
+    else if (/^(Not found|All downloads failed|Out of download retries|Failed)\b/.test(line)) failed++;
+  }
+  const current = [...logs].reverse().find((l) => /^(Searching|Initialize|InProgress|Queued)/.test(l));
+  return { total, ok, failed, current };
+}
+
+function DownloadProgress({ logs, fallbackTotal }: { logs: string[]; fallbackTotal: number }) {
+  const { total, ok, failed, current } = downloadProgress(logs, fallbackTotal);
+  const done = ok + failed;
+  const pct = total > 0 ? Math.min(100, (done / total) * 100) : 0;
+  return (
+    <div style={{ marginBottom: 12, fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", color: C.muted, marginBottom: 6 }}>
+        <span>{total > 0 ? `${done}/${total} morceaux` : `${done} morceaux traités`}</span>
+        <span><span style={{ color: "#34d399" }}>✓ {ok}</span>{failed > 0 && <span style={{ color: "#f87171", marginLeft: 10 }}>✗ {failed}</span>}</span>
+      </div>
+      <div style={{ height: 6, borderRadius: 3, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
+        <div style={{ width: `${pct}%`, height: "100%", background: C.cyan, transition: "width 0.3s" }} />
+      </div>
+      {current && <div style={{ marginTop: 6, color: "rgba(255,255,255,0.45)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{current}</div>}
+    </div>
+  );
+}
+
 function LogTerminal({ logs, status }: { logs: string[]; status: AppStatus }) {
   const endRef = useRef<HTMLDivElement>(null);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [logs]);
@@ -561,6 +592,7 @@ export default function App() {
           {showLogs && (
             <div>
               <div style={{ marginBottom: 10, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: "0.05em" }}>Sortie sldl</div>
+              <DownloadProgress logs={logs} fallbackTotal={mode === "csv" ? selectedCount : 0} />
               <LogTerminal logs={logs} status={status} />
               {(status === "done" || status === "stopped") && (
                 <div style={{ marginTop: 14, padding: "12px 16px", borderRadius: 10, background: status === "done" ? "rgba(16,185,129,0.08)" : "rgba(239,68,68,0.08)", border: `1px solid ${status === "done" ? "rgba(16,185,129,0.2)" : "rgba(239,68,68,0.2)"}`, fontFamily: "'Outfit', sans-serif", fontSize: 14, fontWeight: 600, color: status === "done" ? "#34d399" : "#f87171" }}>

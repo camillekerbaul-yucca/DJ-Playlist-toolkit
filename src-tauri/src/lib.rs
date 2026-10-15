@@ -38,6 +38,30 @@ fn find_sldl(app: &AppHandle) -> Option<String> {
     })
 }
 
+// sldl/ffmpeg are console programs: spawned from a GUI app, Windows would give
+// each one its own (empty) console window. Their output is piped into the app instead.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn hidden_std_command(program: &str) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+fn hidden_command(program: &str) -> tokio::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = tokio::process::Command::new(program);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 fn emit_progress(app: &AppHandle, channel: &str, step: &str, percent: u32, message: &str) {
     app.emit(channel, serde_json::json!({ "step": step, "percent": percent, "message": message })).ok();
 }
@@ -151,7 +175,7 @@ async fn download_ffmpeg(app: AppHandle) -> Result<(), String> {
 fn check_sldl(app: AppHandle) -> bool {
     let Some(path) = find_sldl(&app) else { return false };
     // Verify the binary actually runs (catches .NET-missing or corrupt installs)
-    std::process::Command::new(&path)
+    hidden_std_command(&path)
         .arg("--version")
         .output()
         .map(|o| o.status.success())
@@ -292,20 +316,25 @@ async fn run_sldl(
     let sldl_bin = find_sldl(&app)
         .ok_or_else(|| "sldl introuvable. Relancez l'application pour l'installer.".to_string())?;
 
-    let mut child = tokio::process::Command::new(&sldl_bin)
+    // sldl writes its status lines to stdout; with stdout piped it skips the
+    // in-place progress bars and prints one line per state change instead.
+    let mut child = hidden_command(&sldl_bin)
         .args(&args)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("Impossible de lancer sldl: {e}"))?;
 
     *state.0.lock().map_err(|e| e.to_string())? = child.id();
 
+    let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
+    let out_task = tokio::spawn(stream_to_logs(stdout, app.clone(), |_| false));
     let err_task = tokio::spawn(stream_to_logs(stderr, app.clone(), |_| false));
 
     let status = child.wait().await.map_err(|e| e.to_string())?;
+    out_task.await.ok();
     err_task.await.ok();
 
     *state.0.lock().map_err(|e| e.to_string())? = None;
@@ -317,7 +346,7 @@ async fn run_sldl(
 fn stop_sldl(state: State<'_, SldlProcess>) -> Result<(), String> {
     if let Some(pid) = state.0.lock().map_err(|e| e.to_string())?.take() {
         #[cfg(target_os = "windows")]
-        std::process::Command::new("taskkill")
+        hidden_std_command("taskkill")
             .args(["/F", "/PID", &pid.to_string()])
             .output()
             .map_err(|e| e.to_string())?;
@@ -427,7 +456,7 @@ async fn convert_to_aiff(app: AppHandle, state: State<'_, SldlProcess>, dir: Str
 
         app.emit("sldl-log", &format!("[{}/{}] {}", i + 1, total, name)).ok();
 
-        let mut child = tokio::process::Command::new(&ffmpeg)
+        let mut child = hidden_command(&ffmpeg)
             .args([
                 "-loglevel", "warning",
                 "-i", &file.to_string_lossy(),
