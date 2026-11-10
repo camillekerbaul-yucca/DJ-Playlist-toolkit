@@ -95,15 +95,19 @@ pub fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Finds the download URL of the first asset of a repo's latest GitHub release
-/// for which `pick` returns true (tried in order of the `picks` list).
-async fn latest_asset_url(
+/// sldl is pinned: from 3.0 it was renamed "sockseek" with a different CLI.
+const SLDL_RELEASE: &str = "tags/v2.6.0";
+
+/// Finds the download URL of the first asset of a GitHub release ("latest" or
+/// "tags/<tag>") for which `pick` returns true (tried in order of `picks`).
+async fn release_asset_url(
     client: &reqwest::Client,
     repo: &str,
+    release: &str,
     picks: &[&(dyn Fn(&str) -> bool + Sync)],
 ) -> Result<String, String> {
     let release: serde_json::Value = client
-        .get(format!("https://api.github.com/repos/{repo}/releases/latest"))
+        .get(format!("https://api.github.com/repos/{repo}/releases/{release}"))
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -120,7 +124,7 @@ async fn latest_asset_url(
             return Ok(url.to_string());
         }
     }
-    Err(format!("Aucun fichier adapté dans la dernière release de {repo}"))
+    Err(format!("Aucun fichier adapté pour ce système dans la release de {repo}"))
 }
 
 /// Downloads a URL into memory, reporting progress between 5 % and 85 %.
@@ -183,26 +187,33 @@ fn make_executable(path: &PathBuf) {
 #[cfg(not(unix))]
 fn make_executable(_path: &PathBuf) {}
 
+/// Asset-name fragment for this OS / CPU, as used by sldl and ffmpeg-static.
+fn mac_arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" }
+}
+
 pub async fn install_sldl(app: &AppHandle) -> Result<(), String> {
     let ch = "sldl-install-progress";
     let dest = local_path(app, Tool::Sldl)?;
-    emit_progress(app, ch, "fetching", 0, "Recherche de la dernière version…");
+    emit_progress(app, ch, "fetching", 0, "Recherche de la version…");
     let client = http_client()?;
-    let url = latest_asset_url(
-        &client,
-        "fiso64/sldl",
-        &[
-            &|n: &str| n.ends_with(".zip") && n.contains("win") && n.contains("self-contained"),
-            &|n: &str| n.ends_with(".zip") && n.contains("win"),
-        ],
-    )
-    .await?;
+    let os_asset = if cfg!(windows) {
+        "sldl_win-x86_self-contained.zip".to_string()
+    } else if cfg!(target_os = "macos") {
+        format!("sldl_osx-{}.zip", mac_arch())
+    } else if cfg!(target_arch = "aarch64") {
+        "sldl_linux-arm.zip".to_string()
+    } else {
+        "sldl_linux-x64.zip".to_string()
+    };
+    let url = release_asset_url(&client, "fiso64/sldl", SLDL_RELEASE, &[&|n: &str| n == os_asset]).await?;
     emit_progress(app, ch, "downloading", 5, "Téléchargement…");
     let bytes = download_bytes(app, &client, &url, ch).await?;
     emit_progress(app, ch, "extracting", 88, "Extraction…");
-    if extract_from_zip(bytes, &[("sldl.exe", dest)])? == 0 {
-        return Err("sldl.exe introuvable dans l'archive".into());
+    if extract_from_zip(bytes, &[(Tool::Sldl.exe(), dest.clone())])? == 0 {
+        return Err("sldl introuvable dans l'archive".into());
     }
+    make_executable(&dest);
     emit_progress(app, ch, "done", 100, "installé");
     Ok(())
 }
@@ -213,9 +224,32 @@ pub async fn install_ffmpeg(app: &AppHandle) -> Result<(), String> {
     let ffprobe = local_path(app, Tool::Ffprobe)?;
     emit_progress(app, ch, "fetching", 0, "Recherche de la dernière version…");
     let client = http_client()?;
-    let url = latest_asset_url(
+
+    if !cfg!(windows) {
+        // BtbN has no macOS builds: static binaries from ffmpeg-static instead.
+        let platform = if cfg!(target_os = "macos") {
+            format!("darwin-{}", mac_arch())
+        } else if cfg!(target_arch = "aarch64") {
+            "linux-arm64".to_string()
+        } else {
+            "linux-x64".to_string()
+        };
+        for (i, (name, dest)) in [("ffmpeg", &ffmpeg), ("ffprobe", &ffprobe)].into_iter().enumerate() {
+            let asset = format!("{name}-{platform}");
+            let url = release_asset_url(&client, "eugeneware/ffmpeg-static", "latest", &[&|n: &str| n == asset]).await?;
+            emit_progress(app, ch, "downloading", 5, &format!("Téléchargement de {name} ({}/2)…", i + 1));
+            let bytes = download_bytes(app, &client, &url, ch).await?;
+            std::fs::write(dest, bytes).map_err(|e| e.to_string())?;
+            make_executable(dest);
+        }
+        emit_progress(app, ch, "done", 100, "installé");
+        return Ok(());
+    }
+
+    let url = release_asset_url(
         &client,
         "BtbN/FFmpeg-Builds",
+        "latest",
         &[
             &|n: &str| n.contains("win64") && n.contains("lgpl") && n.ends_with(".zip") && !n.contains("shared"),
             &|n: &str| n.contains("win64") && n.ends_with(".zip") && !n.contains("shared"),
@@ -239,7 +273,7 @@ pub async fn install_ytdlp(app: &AppHandle) -> Result<(), String> {
     emit_progress(app, ch, "fetching", 0, "Recherche de la dernière version…");
     let client = http_client()?;
     let asset = if cfg!(windows) { "yt-dlp.exe" } else if cfg!(target_os = "macos") { "yt-dlp_macos" } else { "yt-dlp" };
-    let url = latest_asset_url(&client, "yt-dlp/yt-dlp", &[&|n: &str| n == asset]).await?;
+    let url = release_asset_url(&client, "yt-dlp/yt-dlp", "latest", &[&|n: &str| n == asset]).await?;
     emit_progress(app, ch, "downloading", 5, "Téléchargement…");
     let bytes = download_bytes(app, &client, &url, ch).await?;
     std::fs::write(&dest, bytes).map_err(|e| e.to_string())?;
