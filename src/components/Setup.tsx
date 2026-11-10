@@ -7,7 +7,7 @@ import { Logo } from "./Icons";
 const TOOLS = [
   { id: "sldl", label: "sldl", hint: "client Soulseek" },
   { id: "ffmpeg", label: "ffmpeg", hint: "conversion AIFF" },
-  { id: "ytdlp", label: "yt-dlp", hint: "listes YouTube et secours SoundCloud" },
+  { id: "ytdlp", label: "yt-dlp", hint: "listes YouTube, secours SoundCloud et YouTube" },
 ] as const;
 
 type ToolId = (typeof TOOLS)[number]["id"];

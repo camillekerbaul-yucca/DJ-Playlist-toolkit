@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AppConfig, IndexEntry, Playlist, RunRow, ToolStatus } from "./lib/types";
+import type { AppConfig, IndexEntry, Playlist, RunRow, ToolStatus, Track } from "./lib/types";
 import { applyIndex, applyLogLine, buildSldlArgs, joinPath, MIX_SECONDS, rowKey, sanitizeName } from "./lib/run";
 import { Setup } from "./components/Setup";
 import { Settings } from "./components/Settings";
@@ -115,13 +115,16 @@ export default function App() {
       let current = applyIndex(rowsRef.current, entries);
       setRows(current);
 
-      // 2. SoundCloud fallback for what Soulseek did not have
-      const wanted = current.filter((r) => r.phase === "notfound" && r.track.url);
-      if (playlist.source === "soundcloud" && options.scFallback && wanted.length) {
+      // 2. SoundCloud / YouTube fallback for what Soulseek did not have
+      const webUrl = (t: Track) => t.url || (t.yt_id ? `https://www.youtube.com/watch?v=${t.yt_id}` : null);
+      const wanted = current.filter((r) => r.phase === "notfound" && webUrl(r.track));
+      const webSource = playlist.source === "soundcloud" || playlist.source === "youtube";
+      if (webSource && options.scFallback && wanted.length) {
         setStage("fallback");
-        const results = await invoke<{ key: string; path: string | null }[]>("soundcloud_fallback", {
+        const results = await invoke<{ key: string; path: string | null }[]>("web_fallback", {
           dir,
-          items: wanted.map((r) => ({ key: r.key, url: r.track.url, artist: r.track.artist, title: r.track.title })),
+          source: playlist.source,
+          items: wanted.map((r) => ({ key: r.key, url: webUrl(r.track), artist: r.track.artist, title: r.track.title })),
         });
         const byKey = new Map(results.map((x) => [x.key, x.path]));
         current = current.map((r) => byKey.has(r.key)
@@ -196,7 +199,7 @@ export default function App() {
         )}
         {screen === "run" && (
           <RunScreen
-            name={options.name} dir={runDir} rows={rows} stage={stage} stageDetail={stageDetail}
+            name={options.name} source={playlist?.source ?? "csv"} dir={runDir} rows={rows} stage={stage} stageDetail={stageDetail}
             logs={logs} error={runError} onStop={stop} onReset={reset}
             onOpen={() => invoke("open_folder", { path: runDir }).catch((e) => setRunError(String(e)))}
           />

@@ -1,21 +1,21 @@
 import { useEffect, useRef } from "react";
-import type { RunRow } from "../lib/types";
+import type { RunRow, Source } from "../lib/types";
 import { extOf } from "../lib/run";
 import { CheckCircle } from "./Icons";
 
 export type Stage = "sldl" | "fallback" | "aiff" | "done" | "stopped" | "error";
 
-function statusOf(r: RunRow): { label: string; cls: string } {
+function statusOf(r: RunRow, web: string, webQ: string): { label: string; cls: string } {
   if (r.converting) return { label: "Conversion AIFF…", cls: "live" };
   switch (r.phase) {
     case "wait": return { label: "En attente", cls: "" };
     case "search": return { label: "Recherche Soulseek…", cls: "live" };
     case "active": return { label: "Téléchargement…", cls: "dl" };
     case "notfound": return { label: "Pas sur Soulseek", cls: "bad" };
-    case "fallback": return { label: "SoundCloud…", cls: "dl" };
+    case "fallback": return { label: `${web}…`, cls: "dl" };
     case "missing": return { label: "Introuvable", cls: "bad" };
     case "cancelled": return { label: "Annulé", cls: "" };
-    case "sc": return { label: r.converted ? "AIFF · depuis SC 160k" : "SoundCloud 160k", cls: "sc" };
+    case "sc": return { label: r.converted ? `AIFF · depuis ${webQ}` : webQ, cls: "sc" };
     case "found": {
       const ext = extOf(r.file);
       if (r.converted) return { label: `AIFF ✓ · depuis ${ext.toUpperCase()}`, cls: "ok" };
@@ -25,8 +25,9 @@ function statusOf(r: RunRow): { label: string; cls: string } {
   }
 }
 
-export function RunScreen({ name, dir, rows, stage, stageDetail, logs, error, onStop, onOpen, onReset }: {
+export function RunScreen({ name, source, dir, rows, stage, stageDetail, logs, error, onStop, onOpen, onReset }: {
   name: string;
+  source: Source;
   dir: string;
   rows: RunRow[];
   stage: Stage;
@@ -37,6 +38,8 @@ export function RunScreen({ name, dir, rows, stage, stageDetail, logs, error, on
   onOpen: () => void;
   onReset: () => void;
 }) {
+  const web = source === "youtube" ? "YouTube" : "SoundCloud";
+  const webQ = source === "youtube" ? "YouTube · MP3 320" : "SoundCloud 160k";
   const running = stage === "sldl" || stage === "fallback" || stage === "aiff";
   const settled = (r: RunRow) => ["found", "sc", "missing", "cancelled"].includes(r.phase) || (r.phase === "notfound" && stage !== "sldl");
   // While sldl runs, downloads are only known from its "Succeeded" lines.
@@ -57,7 +60,7 @@ export function RunScreen({ name, dir, rows, stage, stageDetail, logs, error, on
 
   const stageLabel: Record<Stage, string> = {
     sldl: "Recherche et téléchargement sur Soulseek…",
-    fallback: "Récupération sur SoundCloud des morceaux manquants…",
+    fallback: `Récupération sur ${web} des morceaux manquants…`,
     aiff: "Conversion AIFF…",
     done: "Terminé",
     stopped: "Arrêté",
@@ -80,7 +83,7 @@ export function RunScreen({ name, dir, rows, stage, stageDetail, logs, error, on
           <span>{done} / {rows.length} traités</span>
           {lossless > 0 && <span style={{ color: "var(--accent)" }}>{lossless} lossless</span>}
           {mp3 > 0 && <span style={{ color: "var(--accent)" }}>{mp3} MP3 320</span>}
-          {sc > 0 && <span style={{ color: "var(--sc)" }}>{sc} depuis SoundCloud</span>}
+          {sc > 0 && <span style={{ color: "var(--sc)" }}>{sc} depuis {web}</span>}
           {missing > 0 && <span style={{ color: "var(--bad)" }}>{missing} introuvable{missing > 1 ? "s" : ""}</span>}
           {converted > 0 && <span>{converted} converti{converted > 1 ? "s" : ""} en AIFF</span>}
         </div>
@@ -104,7 +107,7 @@ export function RunScreen({ name, dir, rows, stage, stageDetail, logs, error, on
 
       <div className="list run-list">
         {rows.map((r, i) => {
-          const s = statusOf(r);
+          const s = statusOf(r, web, webQ);
           const dim = r.phase === "missing" || r.phase === "cancelled";
           return (
             <div key={r.key} className="run-row">

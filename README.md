@@ -31,6 +31,7 @@ Download the latest installer from the [Releases](../../releases/latest) page:
 4. Optionally:
    - **Convertir en AIFF Pioneer**: AIFF 16-bit / 44.1 kHz with title, artist and cover art. MP3s stay MP3.
    - **Secours SoundCloud** (SoundCloud sources): tracks not found on Soulseek are taken from SoundCloud (160 kbps), with `(SC)` in the file name.
+   - **Secours YouTube** (YouTube sources): tracks not found on Soulseek are taken from YouTube as MP3 320 (YouTube audio is ~160 kbps at best), with `(YT)` in the file name.
 5. Enter your Soulseek account in ⚙ (a new username/password pair creates the account on first login).
 6. Hit **Télécharger**. Files land in `Music/SLDL/<playlist name>/`.
 

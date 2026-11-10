@@ -243,15 +243,18 @@ fn find_with_stem(base: &Path) -> Option<String> {
     })
 }
 
-/// Downloads tracks Soulseek did not have straight from SoundCloud with yt-dlp.
-/// Files get a "(SC)" suffix so their lower quality stays visible in rekordbox.
+/// Downloads tracks Soulseek did not have straight from SoundCloud or YouTube
+/// with yt-dlp. Files get a "(SC)" / "(YT)" suffix so their lower quality stays
+/// visible in rekordbox.
 #[tauri::command]
-async fn soundcloud_fallback(
+async fn web_fallback(
     app: AppHandle,
     job: State<'_, Job>,
     dir: String,
+    source: String,
     items: Vec<FallbackItem>,
 ) -> Result<Vec<FallbackResult>, String> {
+    let youtube = source == "youtube";
     let ytdlp = tools::find(&app, Tool::YtDlp).ok_or("yt-dlp introuvable. Relance l'application.")?;
     let ffmpeg = tools::find(&app, Tool::Ffmpeg);
     let mut results = Vec::new();
@@ -260,13 +263,27 @@ async fn soundcloud_fallback(
             break;
         }
         app.emit("fallback-progress", serde_json::json!({ "key": item.key, "status": "running" })).ok();
-        let base = Path::new(&dir).join(sanitize_filename(&format!("{} - {} (SC)", item.artist, item.title)));
+        let name = if youtube {
+            // YouTube: the video title is usually "Artist - Title", the channel a label.
+            match sources::split_artist_title(&item.title) {
+                Some((a, t)) => format!("{a} - {t} (YT)"),
+                None if item.artist.is_empty() => format!("{} (YT)", item.title),
+                None => format!("{} - {} (YT)", item.artist, item.title),
+            }
+        } else {
+            format!("{} - {} (SC)", item.artist, item.title)
+        };
+        let base = Path::new(&dir).join(sanitize_filename(&name));
         let mut cmd = tools::hidden_command(&ytdlp);
-        cmd.args([
-            "--no-playlist", "--no-progress", "--no-warnings",
+        cmd.args(["--no-playlist", "--no-progress", "--no-warnings"]);
+        if youtube {
+            // YouTube audio tops out around 160 kbps; MP3 320 so every CDJ reads it.
+            cmd.args(["-f", "bestaudio", "-x", "--audio-format", "mp3", "--audio-quality", "320K", "--postprocessor-args", "ExtractAudio:-ar 44100"]);
+        } else {
             // SoundCloud's own AAC/MP3 streams, or the original file when the artist allows downloads
-            "--extractor-args", "soundcloud:formats=*_aac,*_mp3",
-            "-f", "bestaudio",
+            cmd.args(["--extractor-args", "soundcloud:formats=*_aac,*_mp3", "-f", "bestaudio"]);
+        }
+        cmd.args([
             "--embed-metadata", "--embed-thumbnail", "--convert-thumbnails", "jpg",
             // "Artist - Title" uploads: put the artist in the artist tag
             "--parse-metadata", "title:%(artist)s - %(title)s",
@@ -487,7 +504,7 @@ pub fn run() {
             run_sldl,
             stop_job,
             read_sldl_index,
-            soundcloud_fallback,
+            web_fallback,
             convert_to_aiff,
             pick_folder,
             pick_csv,
