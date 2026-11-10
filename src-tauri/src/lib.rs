@@ -191,6 +191,7 @@ pub struct IndexEntry {
 /// sldl's index of what it downloaded (and what it could not find).
 #[tauri::command]
 fn read_sldl_index(path: String) -> Result<Vec<IndexEntry>, String> {
+    flatten_downloads(Path::new(&path))?;
     let mut rdr = csv::Reader::from_path(&path).map_err(|e| format!("Index sldl illisible : {e}"))?;
     let headers = rdr.headers().map_err(|e| e.to_string())?.clone();
     let col = |name: &str| headers.iter().position(|h| h == name);
@@ -214,6 +215,83 @@ fn read_sldl_index(path: String) -> Result<Vec<IndexEntry>, String> {
             }
         })
         .collect())
+}
+
+/// sldl sometimes skips --name-format (e.g. when it cannot read a file's tags)
+/// and leaves the file under its original name in a "<playlist>/" subfolder.
+/// Moves every indexed file that sits in a subfolder up to the playlist folder
+/// as "Artist - Title.ext", updates the index, and removes emptied subfolders.
+fn flatten_downloads(index: &Path) -> Result<usize, String> {
+    let Some(base) = index.parent() else { return Ok(0) };
+    // Flexible: an odd-length line must be kept as-is, not dropped on rewrite.
+    let Ok(mut rdr) = csv::ReaderBuilder::new().flexible(true).from_path(index) else { return Ok(0) };
+    let headers = rdr.headers().map_err(|e| e.to_string())?.clone();
+    let col = |name: &str| headers.iter().position(|h| h == name);
+    let (Some(fp), Some(ar), Some(ti)) = (col("filepath"), col("artist"), col("title")) else { return Ok(0) };
+    let mut rows: Vec<csv::StringRecord> = rdr.records().flatten().collect();
+
+    let mut moved = 0;
+    let mut emptied = Vec::new();
+    for row in rows.iter_mut() {
+        let rel = row.get(fp).unwrap_or("");
+        let rel = rel.strip_prefix("./").or_else(|| rel.strip_prefix(".\\")).unwrap_or(rel);
+        if rel.is_empty() || !(rel.contains('/') || rel.contains('\\')) {
+            continue;
+        }
+        let src = base.join(rel);
+        if !src.is_file() {
+            continue;
+        }
+        let ext = src.extension().and_then(|x| x.to_str()).unwrap_or("").to_string();
+        let (artist, title) = (row.get(ar).unwrap_or("").trim(), row.get(ti).unwrap_or("").trim());
+        let stem = match (artist.is_empty(), title.is_empty()) {
+            (false, false) => format!("{artist} - {title}"),
+            _ => src.file_stem().and_then(|x| x.to_str()).unwrap_or("track").to_string(),
+        };
+        let stem = sanitize_filename(&stem);
+        let mut dst = base.join(format!("{stem}.{ext}"));
+        let mut n = 2;
+        while dst.exists() {
+            dst = base.join(format!("{stem} ({n}).{ext}"));
+            n += 1;
+        }
+        if std::fs::rename(&src, &dst).is_err() {
+            continue;
+        }
+        if let Some(parent) = src.parent() {
+            emptied.push(parent.to_path_buf());
+        }
+        let name = dst.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
+        let mut fields: Vec<String> = row.iter().map(String::from).collect();
+        fields[fp] = format!("./{name}"); // fp < row.len(): row.get(fp) was non-empty
+        *row = csv::StringRecord::from(fields);
+        moved += 1;
+    }
+    if moved == 0 {
+        return Ok(0);
+    }
+
+    let mut w = csv::WriterBuilder::new().flexible(true).from_path(index).map_err(|e| e.to_string())?;
+    w.write_record(&headers).map_err(|e| e.to_string())?;
+    for r in &rows {
+        w.write_record(r).map_err(|e| e.to_string())?;
+    }
+    w.flush().map_err(|e| e.to_string())?;
+    // Deepest first; remove_dir only succeeds on folders that are now empty.
+    emptied.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for d in emptied {
+        let mut d = d.as_path();
+        while d != base && d.starts_with(base) {
+            if std::fs::remove_dir(d).is_err() {
+                break;
+            }
+            match d.parent() {
+                Some(p) => d = p,
+                None => break,
+            }
+        }
+    }
+    Ok(moved)
 }
 
 // ─── SoundCloud fallback ──────────────────────────────────────────────────────
@@ -519,6 +597,32 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn flattens_sldl_subfolder() {
+        let dir = std::env::temp_dir().join("djpt-flatten acid house case");
+        std::fs::remove_dir_all(&dir).ok();
+        let sub = dir.join("acid house case");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("01 Nese Karabocek - Yali Yali (Todd Terje Edit).aiff"), b"x").unwrap();
+        std::fs::write(dir.join("Boo Williams - Day and Night.aiff"), b"x").unwrap();
+        let index = dir.join("_index.csv");
+        std::fs::write(&index, "filepath,artist,album,title,length,tracktype,state,failurereason\n\
+            ./Boo Williams - Day and Night.aiff,Boo Williams,,Day and Night,400,0,1,0\n\
+            ./acid house case\\01 Nese Karabocek - Yali Yali (Todd Terje Edit).aiff,Nese Karabocek,,YALI YALI (Todd Terje Edit),356,0,1,0\n\
+            ,disrupt303,,Bobby Konders Nervous Acid,301,0,2,3\n").unwrap();
+
+        assert_eq!(flatten_downloads(&index).unwrap(), 1);
+        assert!(dir.join("Nese Karabocek - YALI YALI (Todd Terje Edit).aiff").is_file());
+        assert!(!sub.exists(), "emptied subfolder removed");
+        let entries = read_sldl_index(index.to_string_lossy().into()).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(entries[1].filepath.ends_with("Nese Karabocek - YALI YALI (Todd Terje Edit).aiff"));
+        assert!(Path::new(&entries[1].filepath).is_file());
+        assert_eq!(entries[2].state, 2);
+        assert_eq!(flatten_downloads(&index).unwrap(), 0, "idempotent");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn finds_fallback_file_in_emoji_folder() {
         let dir = std::env::temp_dir().join("djpt-test ⛵ SVP 🌞");
