@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "sldl dj toolkit",
+  "productName": "DJ Playlist toolkit",
   "version": "0.1.0",
   "identifier": "fr.yuccalab.sldldjtoolkit",
   "build": {
@@ -12,10 +12,10 @@
   "app": {
     "windows": [
       {
-        "title": "sldl dj toolkit",
-        "width": 860,
-        "height": 780,
-        "minWidth": 760,
+        "title": "DJ Playlist toolkit",
+        "width": 1120,
+        "height": 820,
+        "minWidth": 720,
         "minHeight": 600,
         "center": true,
         "resizable": true

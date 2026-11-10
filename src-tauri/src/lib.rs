@@ -1,12 +1,24 @@
-use std::path::PathBuf;
-use std::sync::Mutex;
-use futures_util::StreamExt;
-use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_dialog::DialogExt;
-use serde::{Deserialize, Serialize};
+mod sources;
+mod tools;
 
-// Stores the PID of the running sldl process so stop_sldl can kill it.
-struct SldlProcess(Mutex<Option<u32>>);
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, State};
+use tauri_plugin_dialog::DialogExt;
+
+use sources::{Playlist, Track};
+use tools::Tool;
+
+/// The running child process (sldl, yt-dlp or ffmpeg) and a cancel flag for
+/// the multi-file steps, so the Stop button can end whatever is in progress.
+#[derive(Default)]
+struct Job {
+    pid: Mutex<Option<u32>>,
+    cancelled: AtomicBool,
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppConfig {
@@ -15,270 +27,94 @@ pub struct AppConfig {
     pub output_dir: String,
 }
 
-// ─── sldl discovery ──────────────────────────────────────────────────────────
+// ─── Tools ────────────────────────────────────────────────────────────────────
 
-fn sldl_local_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+#[derive(Serialize)]
+struct ToolStatus {
+    sldl: bool,
+    ffmpeg: bool,
+    ytdlp: bool,
+}
+
+#[tauri::command]
+fn check_tools(app: AppHandle) -> ToolStatus {
+    ToolStatus {
+        // sldl --version catches .NET-missing or corrupt installs
+        sldl: tools::find(&app, Tool::Sldl).is_some_and(|p| tools::runs(&p, "--version")),
+        ffmpeg: tools::find(&app, Tool::Ffmpeg).is_some(),
+        ytdlp: tools::find(&app, Tool::YtDlp).is_some_and(|p| tools::runs(&p, "--version")),
+    }
+}
+
+#[tauri::command]
+async fn install_tool(app: AppHandle, tool: String) -> Result<(), String> {
+    match tool.as_str() {
+        "sldl" => tools::install_sldl(&app).await,
+        "ffmpeg" => tools::install_ffmpeg(&app).await,
+        "ytdlp" => tools::install_ytdlp(&app).await,
+        other => Err(format!("Outil inconnu : {other}")),
+    }
+}
+
+// ─── Sources ──────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn resolve_playlist(app: AppHandle, url: String) -> Result<Playlist, String> {
+    sources::resolve(&app, &url).await
+}
+
+fn csv_field(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// Characters Windows refuses in file names, plus trailing dots/spaces.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if "<>:\"/\\|?*".contains(c) || c.is_control() { '_' } else { c })
+        .collect();
+    let trimmed = cleaned.trim().trim_end_matches(['.', ' ']).to_string();
+    if trimmed.is_empty() { "playlist".into() } else { trimmed.chars().take(120).collect() }
+}
+
+/// Writes the selected tracks as the CSV sldl reads (lengths in seconds).
+/// The file is named after the playlist because sldl uses it as the list name.
+#[tauri::command]
+fn write_track_csv(name: String, tracks: Vec<Track>) -> Result<String, String> {
+    let dir = std::env::temp_dir().join("dj-playlist-toolkit");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let exe = if cfg!(windows) { "sldl.exe" } else { "sldl" };
-    Ok(dir.join(exe))
-}
-
-fn find_sldl(app: &AppHandle) -> Option<String> {
-    if let Ok(p) = sldl_local_path(app) {
-        if p.exists() {
-            return Some(p.to_string_lossy().into_owned());
-        }
+    let path = dir.join(format!("{}.csv", sanitize_filename(&name)));
+    let mut out = String::from("Artist,Title,Album,Length,YT Id\n");
+    for t in &tracks {
+        out += &[
+            csv_field(&t.artist),
+            csv_field(&t.title),
+            csv_field(&t.album),
+            t.length.map(|l| l.to_string()).unwrap_or_default(),
+            csv_field(t.yt_id.as_deref().unwrap_or("")),
+        ]
+        .join(",");
+        out.push('\n');
     }
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    let exe = if cfg!(windows) { "sldl.exe" } else { "sldl" };
-    std::env::var("PATH").ok()?.split(sep).find_map(|dir| {
-        let p = PathBuf::from(dir).join(exe);
-        p.exists().then(|| p.to_string_lossy().into_owned())
-    })
+    std::fs::write(&path, out.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
-// sldl/ffmpeg are console programs: spawned from a GUI app, Windows would give
-// each one its own (empty) console window. Their output is piped into the app instead.
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+// ─── Running sldl ─────────────────────────────────────────────────────────────
 
-fn hidden_std_command(program: &str) -> std::process::Command {
-    #[allow(unused_mut)]
-    let mut cmd = std::process::Command::new(program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd
-}
-
-fn hidden_command(program: &str) -> tokio::process::Command {
-    #[allow(unused_mut)]
-    let mut cmd = tokio::process::Command::new(program);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    cmd
-}
-
-fn emit_progress(app: &AppHandle, channel: &str, step: &str, percent: u32, message: &str) {
-    app.emit(channel, serde_json::json!({ "step": step, "percent": percent, "message": message })).ok();
-}
-
-fn ffmpeg_local_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-    Ok(dir.join(exe))
-}
-
-fn find_ffmpeg(app: &AppHandle) -> Option<String> {
-    if let Ok(p) = ffmpeg_local_path(app) {
-        if p.exists() {
-            return Some(p.to_string_lossy().into_owned());
-        }
-    }
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-    std::env::var("PATH").ok()?.split(sep).find_map(|dir| {
-        let p = PathBuf::from(dir).join(exe);
-        p.exists().then(|| p.to_string_lossy().into_owned())
-    })
-}
-
-// ─── Commands ─────────────────────────────────────────────────────────────────
-
-#[tauri::command]
-fn check_ffmpeg(app: AppHandle) -> bool {
-    find_ffmpeg(&app).is_some()
-}
-
-#[tauri::command]
-async fn download_ffmpeg(app: AppHandle) -> Result<(), String> {
-    let local_path = ffmpeg_local_path(&app)?;
-
-    emit_progress(&app, "ffmpeg-install-progress", "fetching", 0, "Récupération de la dernière version…");
-
-    let client = reqwest::Client::builder()
-        .user_agent("sldl-dj-toolkit")
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let release: serde_json::Value = client
-        .get("https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest")
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
-
-    let url = release["assets"]
-        .as_array()
-        .and_then(|assets| {
-            // Prefer win64 lgpl static (no "shared" in name)
-            let lgpl = assets.iter().find(|a| {
-                let n = a["name"].as_str().unwrap_or("").to_lowercase();
-                n.contains("win64") && n.contains("lgpl") && n.ends_with(".zip") && !n.contains("shared")
-            });
-            let fallback = assets.iter().find(|a| {
-                let n = a["name"].as_str().unwrap_or("").to_lowercase();
-                n.contains("win64") && n.ends_with(".zip") && !n.contains("shared")
-            });
-            lgpl.or(fallback)
-        })
-        .and_then(|a| a["browser_download_url"].as_str())
-        .ok_or("Aucune release Windows ffmpeg trouvée sur GitHub")?
-        .to_string();
-
-    emit_progress(&app, "ffmpeg-install-progress", "downloading", 5, "Téléchargement ffmpeg…");
-
-    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
-    let total = resp.content_length().unwrap_or(0);
-    let mut zip_bytes: Vec<u8> = Vec::new();
-    let mut downloaded = 0u64;
-    let mut stream = resp.bytes_stream();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
-        downloaded += chunk.len() as u64;
-        zip_bytes.extend_from_slice(&chunk);
-        if total > 0 {
-            let pct = (downloaded as f64 / total as f64 * 80.0) as u32 + 5;
-            emit_progress(&app, "ffmpeg-install-progress", "downloading", pct,
-                &format!("{:.0}/{:.0} MB", downloaded as f64 / 1_000_000.0, total as f64 / 1_000_000.0));
-        }
-    }
-
-    emit_progress(&app, "ffmpeg-install-progress", "extracting", 88, "Extraction de ffmpeg.exe…");
-
-    let cursor = std::io::Cursor::new(zip_bytes);
-    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| e.to_string())?;
-    let mut found = false;
-    for i in 0..archive.len() {
-        let mut f = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name = f.name().to_lowercase();
-        if name.ends_with("bin/ffmpeg.exe") {
-            let mut out = std::fs::File::create(&local_path).map_err(|e| e.to_string())?;
-            std::io::copy(&mut f, &mut out).map_err(|e| e.to_string())?;
-            found = true;
-            break;
-        }
-    }
-
-    if !found {
-        return Err("ffmpeg.exe introuvable dans l'archive téléchargée".to_string());
-    }
-
-    emit_progress(&app, "ffmpeg-install-progress", "done", 100, "ffmpeg installé !");
-    Ok(())
-}
-
-#[tauri::command]
-fn check_sldl(app: AppHandle) -> bool {
-    let Some(path) = find_sldl(&app) else { return false };
-    // Verify the binary actually runs (catches .NET-missing or corrupt installs)
-    hidden_std_command(&path)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-#[tauri::command]
-async fn download_sldl(app: AppHandle) -> Result<(), String> {
-    let local_path = sldl_local_path(&app)?;
-
-    emit_progress(&app, "sldl-install-progress", "fetching", 0, "Récupération de la dernière version…");
-
-    let client = reqwest::Client::builder()
-        .user_agent("sldl-dj-toolkit")
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let release: serde_json::Value = client
-        .get("https://api.github.com/repos/fiso64/sldl/releases/latest")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let url = release["assets"]
-        .as_array()
-        .and_then(|assets| {
-            let sc = assets.iter().find(|a| {
-                let n = a["name"].as_str().unwrap_or("").to_lowercase();
-                n.ends_with(".zip") && n.contains("win") && n.contains("self-contained")
-            });
-            let any = assets.iter().find(|a| {
-                let n = a["name"].as_str().unwrap_or("").to_lowercase();
-                n.ends_with(".zip") && n.contains("win")
-            });
-            sc.or(any)
-        })
-        .and_then(|a| a["browser_download_url"].as_str())
-        .ok_or("Aucune release Windows trouvée sur GitHub")?
-        .to_string();
-
-    emit_progress(&app, "sldl-install-progress", "downloading", 5, "Téléchargement…");
-
-    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
-    let total = resp.content_length().unwrap_or(0);
-    let mut zip_bytes: Vec<u8> = Vec::new();
-    let mut downloaded = 0u64;
-    let mut stream = resp.bytes_stream();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
-        downloaded += chunk.len() as u64;
-        zip_bytes.extend_from_slice(&chunk);
-        if total > 0 {
-            let pct = (downloaded as f64 / total as f64 * 80.0) as u32 + 5;
-            emit_progress(&app, "sldl-install-progress", "downloading", pct,
-                &format!("{:.0}/{:.0} MB", downloaded as f64 / 1_000_000.0, total as f64 / 1_000_000.0));
-        }
-    }
-
-    emit_progress(&app, "sldl-install-progress", "extracting", 88, "Extraction de sldl.exe…");
-
-    let cursor = std::io::Cursor::new(zip_bytes);
-    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| e.to_string())?;
-    let mut found = false;
-    for i in 0..archive.len() {
-        let mut f = archive.by_index(i).map_err(|e| e.to_string())?;
-        if f.name().to_lowercase().ends_with("sldl.exe") {
-            let mut out = std::fs::File::create(&local_path).map_err(|e| e.to_string())?;
-            std::io::copy(&mut f, &mut out).map_err(|e| e.to_string())?;
-            found = true;
-            break;
-        }
-    }
-
-    if !found {
-        return Err("sldl.exe introuvable dans l'archive téléchargée".to_string());
-    }
-
-    emit_progress(&app, "sldl-install-progress", "done", 100, "sldl installé avec succès !");
-    Ok(())
-}
-
-// Returns true for ffmpeg header lines that are too noisy to show.
-fn is_ffmpeg_noise(line: &str) -> bool {
-    let t = line.trim();
-    t.starts_with("ffmpeg version")
-        || t.starts_with("built with")
-        || t.starts_with("configuration:")
-        || (t.starts_with("lib") && t.contains(" / "))
-        || t == "Press [q] to quit, [?] for help"
-}
-
-// Reads a stream in chunks, emitting a log event on every \n or \r.
-// skip: function that returns true for lines that should be suppressed.
-// This avoids pipe-buffer deadlocks caused by sldl's \r-based progress bars.
-async fn stream_to_logs<R: tokio::io::AsyncRead + Unpin>(reader: R, app: AppHandle, skip: fn(&str) -> bool) {
+/// Reads a stream in chunks, emitting a log event on every \n or \r.
+/// This avoids pipe-buffer deadlocks caused by \r-based progress bars.
+async fn stream_to_logs<R: tokio::io::AsyncRead + Unpin>(mut reader: R, app: AppHandle, skip: fn(&str) -> bool) {
     use tokio::io::AsyncReadExt;
-    let mut reader = reader;
     let mut buf = Vec::with_capacity(256);
     let mut chunk = [0u8; 1024];
+    let flush = |buf: &mut Vec<u8>| {
+        let line = String::from_utf8_lossy(buf).trim().to_string();
+        if !line.is_empty() && !skip(&line) {
+            app.emit("sldl-log", &line).ok();
+        }
+        buf.clear();
+    };
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
@@ -286,11 +122,7 @@ async fn stream_to_logs<R: tokio::io::AsyncRead + Unpin>(reader: R, app: AppHand
                 for &b in &chunk[..n] {
                     if b == b'\n' || b == b'\r' {
                         if !buf.is_empty() {
-                            let line = String::from_utf8_lossy(&buf).trim().to_string();
-                            if !line.is_empty() && !skip(&line) {
-                                app.emit("sldl-log", &line).ok();
-                            }
-                            buf.clear();
+                            flush(&mut buf);
                         }
                     } else {
                         buf.push(b);
@@ -300,79 +132,296 @@ async fn stream_to_logs<R: tokio::io::AsyncRead + Unpin>(reader: R, app: AppHand
         }
     }
     if !buf.is_empty() {
-        let line = String::from_utf8_lossy(&buf).trim().to_string();
-        if !line.is_empty() && !skip(&line) {
-            app.emit("sldl-log", &line).ok();
-        }
+        flush(&mut buf);
     }
 }
 
-#[tauri::command]
-async fn run_sldl(
-    app: AppHandle,
-    state: State<'_, SldlProcess>,
-    args: Vec<String>,
-) -> Result<(), String> {
-    let sldl_bin = find_sldl(&app)
-        .ok_or_else(|| "sldl introuvable. Relancez l'application pour l'installer.".to_string())?;
+fn no_skip(_: &str) -> bool {
+    false
+}
 
-    // sldl writes its status lines to stdout; with stdout piped it skips the
-    // in-place progress bars and prints one line per state change instead.
-    let mut child = hidden_command(&sldl_bin)
+/// Runs sldl to completion and returns its exit code. Output goes to "sldl-log" events.
+#[tauri::command]
+async fn run_sldl(app: AppHandle, job: State<'_, Job>, args: Vec<String>) -> Result<i32, String> {
+    let sldl = tools::find(&app, Tool::Sldl).ok_or("sldl introuvable. Relance l'application pour l'installer.")?;
+    job.cancelled.store(false, Ordering::SeqCst);
+
+    // With stdout piped, sldl skips its in-place progress bars and prints one
+    // line per state change instead.
+    let mut child = tools::hidden_command(&sldl)
         .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Impossible de lancer sldl: {e}"))?;
+        .map_err(|e| format!("Impossible de lancer sldl : {e}"))?;
+    *job.pid.lock().map_err(|e| e.to_string())? = child.id();
 
-    *state.0.lock().map_err(|e| e.to_string())? = child.id();
-
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
-    let out_task = tokio::spawn(stream_to_logs(stdout, app.clone(), |_| false));
-    let err_task = tokio::spawn(stream_to_logs(stderr, app.clone(), |_| false));
-
+    let out = tokio::spawn(stream_to_logs(child.stdout.take().expect("piped"), app.clone(), no_skip));
+    let err = tokio::spawn(stream_to_logs(child.stderr.take().expect("piped"), app.clone(), no_skip));
     let status = child.wait().await.map_err(|e| e.to_string())?;
-    out_task.await.ok();
-    err_task.await.ok();
-
-    *state.0.lock().map_err(|e| e.to_string())? = None;
-    app.emit("sldl-done", status.code().unwrap_or(-1)).ok();
-    Ok(())
+    out.await.ok();
+    err.await.ok();
+    *job.pid.lock().map_err(|e| e.to_string())? = None;
+    Ok(status.code().unwrap_or(-1))
 }
 
 #[tauri::command]
-fn stop_sldl(state: State<'_, SldlProcess>) -> Result<(), String> {
-    if let Some(pid) = state.0.lock().map_err(|e| e.to_string())?.take() {
-        #[cfg(target_os = "windows")]
-        hidden_std_command("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
-            .output()
-            .map_err(|e| e.to_string())?;
-        #[cfg(not(target_os = "windows"))]
-        std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .output()
-            .map_err(|e| e.to_string())?;
+fn stop_job(job: State<'_, Job>) -> Result<(), String> {
+    job.cancelled.store(true, Ordering::SeqCst);
+    if let Some(pid) = job.pid.lock().map_err(|e| e.to_string())?.take() {
+        #[cfg(windows)]
+        tools::hidden_std_command("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output().ok();
+        #[cfg(not(windows))]
+        std::process::Command::new("kill").args(["-9", &pid.to_string()]).output().ok();
     }
     Ok(())
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct IndexEntry {
+    filepath: String,
+    artist: String,
+    title: String,
+    /// sldl track state: 1 = downloaded, 3 = already there; anything else = not downloaded.
+    state: u32,
+    failure_reason: u32,
+}
+
+/// sldl's index of what it downloaded (and what it could not find).
 #[tauri::command]
-fn pick_folder(app: AppHandle) -> Result<Option<String>, String> {
-    let result = app.dialog().file().blocking_pick_folder();
-    Ok(result.map(|p| p.to_string()))
+fn read_sldl_index(path: String) -> Result<Vec<IndexEntry>, String> {
+    let mut rdr = csv::Reader::from_path(&path).map_err(|e| format!("Index sldl illisible : {e}"))?;
+    let headers = rdr.headers().map_err(|e| e.to_string())?.clone();
+    let col = |name: &str| headers.iter().position(|h| h == name);
+    let (fp, ar, ti, st, fr) = (col("filepath"), col("artist"), col("title"), col("state"), col("failurereason"));
+    let get = |r: &csv::StringRecord, i: Option<usize>| i.and_then(|i| r.get(i)).unwrap_or("").to_string();
+    let base = Path::new(&path).parent().map(Path::to_path_buf).unwrap_or_default();
+    Ok(rdr
+        .records()
+        .flatten()
+        .map(|r| {
+            let mut filepath = get(&r, fp);
+            if filepath.starts_with("./") || filepath.starts_with(".\\") {
+                filepath = base.join(&filepath[2..]).to_string_lossy().into_owned();
+            }
+            IndexEntry {
+                filepath,
+                artist: get(&r, ar),
+                title: get(&r, ti),
+                state: get(&r, st).parse().unwrap_or(0),
+                failure_reason: get(&r, fr).parse().unwrap_or(0),
+            }
+        })
+        .collect())
+}
+
+// ─── SoundCloud fallback ──────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FallbackItem {
+    key: String,
+    url: String,
+    artist: String,
+    title: String,
+}
+
+#[derive(Serialize, Clone)]
+struct FallbackResult {
+    key: String,
+    path: Option<String>,
+    error: Option<String>,
+}
+
+/// Downloads tracks Soulseek did not have straight from SoundCloud with yt-dlp.
+/// Files get a "(SC)" suffix so their lower quality stays visible in rekordbox.
+#[tauri::command]
+async fn soundcloud_fallback(
+    app: AppHandle,
+    job: State<'_, Job>,
+    dir: String,
+    items: Vec<FallbackItem>,
+) -> Result<Vec<FallbackResult>, String> {
+    let ytdlp = tools::find(&app, Tool::YtDlp).ok_or("yt-dlp introuvable. Relance l'application.")?;
+    let ffmpeg = tools::find(&app, Tool::Ffmpeg);
+    let mut results = Vec::new();
+    for item in items {
+        if job.cancelled.load(Ordering::SeqCst) {
+            break;
+        }
+        app.emit("fallback-progress", serde_json::json!({ "key": item.key, "status": "running" })).ok();
+        let base = Path::new(&dir).join(sanitize_filename(&format!("{} - {} (SC)", item.artist, item.title)));
+        let mut cmd = tools::hidden_command(&ytdlp);
+        cmd.args([
+            "--no-playlist", "--no-progress", "--no-warnings",
+            // SoundCloud's own AAC/MP3 streams, or the original file when the artist allows downloads
+            "--extractor-args", "soundcloud:formats=*_aac,*_mp3",
+            "-f", "bestaudio",
+            "--embed-metadata", "--embed-thumbnail", "--convert-thumbnails", "jpg",
+            // "Artist - Title" uploads: put the artist in the artist tag
+            "--parse-metadata", "title:%(artist)s - %(title)s",
+            "--print", "after_move:filepath",
+            "-o",
+        ]);
+        cmd.arg(format!("{}.%(ext)s", base.to_string_lossy()));
+        if let Some(ff) = &ffmpeg {
+            cmd.arg("--ffmpeg-location").arg(ff);
+        }
+        cmd.arg(&item.url);
+        let child = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("yt-dlp : {e}"))?;
+        *job.pid.lock().map_err(|e| e.to_string())? = child.id();
+        let out = child.wait_with_output().await.map_err(|e| e.to_string())?;
+        *job.pid.lock().map_err(|e| e.to_string())? = None;
+
+        let path = String::from_utf8_lossy(&out.stdout).lines().last().map(|l| l.trim().to_string());
+        let result = match (out.status.success(), path) {
+            (true, Some(p)) if !p.is_empty() => FallbackResult { key: item.key, path: Some(p), error: None },
+            _ => FallbackResult {
+                key: item.key,
+                path: None,
+                error: Some(
+                    String::from_utf8_lossy(&out.stderr)
+                        .lines()
+                        .filter(|l| l.contains("ERROR"))
+                        .last()
+                        .unwrap_or("échec")
+                        .to_string(),
+                ),
+            },
+        };
+        app.emit("fallback-progress", serde_json::json!({
+            "key": result.key, "status": if result.path.is_some() { "ok" } else { "failed" }, "path": result.path
+        }))
+        .ok();
+        results.push(result);
+    }
+    Ok(results)
+}
+
+// ─── AIFF conversion ─────────────────────────────────────────────────────────
+
+/// Formats converted to AIFF. MP3 stays MP3: every CDJ reads it, and converting
+/// it would only make the file bigger.
+const AIFF_SOURCES: [&str; 8] = ["flac", "wav", "ogg", "opus", "m4a", "aac", "wma", "alac"];
+
+fn ffmpeg_is_noise(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("ffmpeg version")
+        || t.starts_with("built with")
+        || t.starts_with("configuration:")
+        || (t.starts_with("lib") && t.contains(" / "))
+}
+
+#[derive(Serialize, Clone)]
+struct Converted {
+    src: String,
+    dst: String,
+    ok: bool,
+}
+
+/// Converts the given files (or, if empty, every convertible file in `dir`) to
+/// AIFF 16-bit / 44.1 kHz with tags and cover art, the format every Pioneer
+/// CDJ and rekordbox read. Originals are removed once converted.
+#[tauri::command]
+async fn convert_to_aiff(
+    app: AppHandle,
+    job: State<'_, Job>,
+    dir: String,
+    files: Vec<String>,
+) -> Result<Vec<Converted>, String> {
+    let ffmpeg = tools::find(&app, Tool::Ffmpeg).ok_or("ffmpeg introuvable")?;
+    let is_convertible = |p: &Path| {
+        p.extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| AIFF_SOURCES.iter().any(|e| e.eq_ignore_ascii_case(x)))
+    };
+    let mut list: Vec<PathBuf> = files.iter().map(PathBuf::from).filter(|p| p.exists() && is_convertible(p)).collect();
+    if files.is_empty() {
+        for e in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+            if e.path().is_file() && is_convertible(&e.path()) {
+                list.push(e.path());
+            }
+        }
+    }
+
+    let total = list.len();
+    let mut done = Vec::new();
+    for (i, src) in list.iter().enumerate() {
+        if job.cancelled.load(Ordering::SeqCst) {
+            break;
+        }
+        let dst = src.with_extension("aiff");
+        app.emit("aiff-progress", serde_json::json!({ "index": i, "total": total, "src": src, "status": "running" })).ok();
+
+        // Ogg/Opus keep their tags on the audio stream, not the container.
+        let ext = src.extension().and_then(|x| x.to_str()).unwrap_or("").to_lowercase();
+        let tag_source = if ext == "ogg" || ext == "opus" { "0:s:a:0" } else { "0" };
+        let mut child = tools::hidden_command(&ffmpeg)
+            .args(["-loglevel", "error", "-y", "-i"])
+            .arg(src)
+            .args([
+                "-map", "0:a:0", "-map", "0:v:0?",
+                "-c:a", "pcm_s16be", "-af", "aresample=44100:dither_method=triangular",
+                "-c:v", "copy", "-disposition:v:0", "attached_pic",
+                "-map_metadata", tag_source,
+                "-write_id3v2", "1", "-id3v2_version", "3",
+                "-f", "aiff",
+            ])
+            .arg(&dst)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("ffmpeg : {e}"))?;
+        *job.pid.lock().map_err(|e| e.to_string())? = child.id();
+        let err = tokio::spawn(stream_to_logs(child.stderr.take().expect("piped"), app.clone(), ffmpeg_is_noise));
+        let status = child.wait().await.map_err(|e| e.to_string())?;
+        err.await.ok();
+        *job.pid.lock().map_err(|e| e.to_string())? = None;
+
+        let ok = status.success() && dst.exists();
+        if ok {
+            std::fs::remove_file(src).ok();
+        } else {
+            std::fs::remove_file(&dst).ok();
+        }
+        let c = Converted { src: src.to_string_lossy().into(), dst: dst.to_string_lossy().into(), ok };
+        app.emit("aiff-progress", serde_json::json!({ "index": i, "total": total, "src": c.src, "dst": c.dst, "status": if ok { "ok" } else { "failed" } })).ok();
+        done.push(c);
+    }
+
+    // Point sldl's index at the new files so a later run of the same playlist
+    // recognises them and only fetches what is new.
+    let index = Path::new(&dir).join("_index.csv");
+    if let Ok(text) = std::fs::read_to_string(&index) {
+        let mut text = text;
+        for c in done.iter().filter(|c| c.ok) {
+            let name_src = Path::new(&c.src).file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let name_dst = Path::new(&c.dst).file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name_src.is_empty() {
+                text = text.replace(name_src, name_dst);
+            }
+        }
+        std::fs::write(&index, text).ok();
+    }
+    Ok(done)
+}
+
+// ─── Files, folders, config ───────────────────────────────────────────────────
+
+#[tauri::command]
+fn pick_folder(app: AppHandle) -> Option<String> {
+    app.dialog().file().blocking_pick_folder().map(|p| p.to_string())
 }
 
 #[tauri::command]
-fn pick_csv(app: AppHandle) -> Result<Option<String>, String> {
-    let result = app
-        .dialog()
-        .file()
-        .add_filter("CSV Files", &["csv"])
-        .blocking_pick_file();
-    Ok(result.map(|p| p.to_string()))
+fn pick_csv(app: AppHandle) -> Option<String> {
+    app.dialog().file().add_filter("CSV", &["csv"]).blocking_pick_file().map(|p| p.to_string())
 }
 
 #[tauri::command]
@@ -381,34 +430,23 @@ fn read_text_file(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn write_temp_csv(content: String) -> Result<String, String> {
-    let path = std::env::temp_dir().join("sldl_selection.csv");
-    std::fs::write(&path, content.as_bytes()).map_err(|e| e.to_string())?;
-    Ok(path.to_string_lossy().to_string())
+fn open_folder(app: AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener().open_path(path, None::<&str>).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn get_config(app: AppHandle) -> Result<AppConfig, String> {
     use tauri_plugin_store::StoreExt;
     let store = app.store("config.json").map_err(|e| e.to_string())?;
-
     let default_output = dirs::audio_dir()
         .map(|p| p.join("SLDL").to_string_lossy().to_string())
         .unwrap_or_else(|| "~/Music/SLDL".to_string());
-
+    let get = |k: &str| store.get(k).and_then(|v| v.as_str().map(String::from));
     Ok(AppConfig {
-        username: store
-            .get("username")
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_default(),
-        password: store
-            .get("password")
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_default(),
-        output_dir: store
-            .get("output_dir")
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or(default_output),
+        username: get("username").unwrap_or_default(),
+        password: get("password").unwrap_or_default(),
+        output_dir: get("output_dir").filter(|s| !s.is_empty()).unwrap_or(default_output),
     })
 }
 
@@ -419,75 +457,7 @@ fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
     store.set("username", serde_json::Value::String(config.username));
     store.set("password", serde_json::Value::String(config.password));
     store.set("output_dir", serde_json::Value::String(config.output_dir));
-    store.save().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-async fn convert_to_aiff(app: AppHandle, state: State<'_, SldlProcess>, dir: String) -> Result<(), String> {
-    let ffmpeg = find_ffmpeg(&app).ok_or_else(|| "ffmpeg introuvable".to_string())?;
-
-    let audio_exts = ["flac", "wav", "ogg", "opus", "m4a", "aac", "wma"];
-
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
-    fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>, exts: &[&str]) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.is_dir() { walk(&p, files, exts); }
-                else if p.extension().and_then(|x| x.to_str()).map(|x| exts.iter().any(|e| e.eq_ignore_ascii_case(x))).unwrap_or(false) {
-                    files.push(p);
-                }
-            }
-        }
-    }
-    walk(std::path::Path::new(&dir), &mut files, &audio_exts);
-
-    let total = files.len();
-    if total == 0 {
-        app.emit("sldl-log", "Aucun fichier audio à convertir.").ok();
-        return Ok(());
-    }
-    app.emit("sldl-log", &format!("── Conversion AIFF ({total} fichiers) ──────────────")).ok();
-
-    for (i, file) in files.iter().enumerate() {
-        let name = file.file_name().unwrap_or_default().to_string_lossy();
-        let aiff = file.with_extension("aiff");
-
-        app.emit("sldl-log", &format!("[{}/{}] {}", i + 1, total, name)).ok();
-
-        let mut child = hidden_command(&ffmpeg)
-            .args([
-                "-loglevel", "warning",
-                "-i", &file.to_string_lossy(),
-                "-c:a", "pcm_s16be", "-ar", "44100", "-f", "aiff", "-y",
-                &aiff.to_string_lossy(),
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("ffmpeg: {e}"))?;
-
-        *state.0.lock().map_err(|e| e.to_string())? = child.id();
-
-        let stderr = child.stderr.take().expect("stderr piped");
-        let err_task = tokio::spawn(stream_to_logs(stderr, app.clone(), is_ffmpeg_noise));
-
-        let status = child.wait().await.map_err(|e| e.to_string())?;
-        err_task.await.ok();
-        *state.0.lock().map_err(|e| e.to_string())? = None;
-
-        if status.success() {
-            std::fs::remove_file(file).ok();
-            app.emit("sldl-log", &format!("  ✓ → {}", aiff.file_name().unwrap_or_default().to_string_lossy())).ok();
-        } else {
-            app.emit("sldl-log", &format!("  ✗ Échec: {name}")).ok();
-        }
-    }
-
-    app.emit("sldl-log", &format!("── Conversion terminée ─────────────────────────")).ok();
-    Ok(())
+    store.save().map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -496,22 +466,40 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
-        .manage(SldlProcess(Mutex::new(None)))
+        .manage(Job::default())
         .invoke_handler(tauri::generate_handler![
-            check_ffmpeg,
-            download_ffmpeg,
-            check_sldl,
-            download_sldl,
+            check_tools,
+            install_tool,
+            resolve_playlist,
+            write_track_csv,
             run_sldl,
-            stop_sldl,
+            stop_job,
+            read_sldl_index,
+            soundcloud_fallback,
+            convert_to_aiff,
             pick_folder,
             pick_csv,
             read_text_file,
-            write_temp_csv,
+            open_folder,
             get_config,
             save_config,
-            convert_to_aiff,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitizes_windows_names() {
+        assert_eq!(sanitize_filename("AC/DC: Back?"), "AC_DC_ Back_");
+        assert_eq!(sanitize_filename("  . "), "playlist");
+    }
+
+    #[test]
+    fn csv_quotes() {
+        assert_eq!(csv_field("say \"hi\", ok"), "\"say \"\"hi\"\", ok\"");
+    }
 }

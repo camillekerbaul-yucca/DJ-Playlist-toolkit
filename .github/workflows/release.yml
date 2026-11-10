@@ -49,14 +49,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: sldl dj toolkit ${{ github.ref_name }}
+          releaseName: DJ Playlist toolkit ${{ github.ref_name }}
           releaseBody: |
             ## Installation
 
-            **Windows** — télécharge `sldl-dj-toolkit_x64-setup.exe`
-            **macOS** — télécharge `sldl-dj-toolkit_universal.dmg`
+            **Windows** — télécharge `DJ Playlist toolkit_x64-setup.exe`
+            **macOS** — télécharge `DJ Playlist toolkit_universal.dmg`
 
-            sldl et ffmpeg sont téléchargés automatiquement au premier lancement.
+            sldl, ffmpeg et yt-dlp sont téléchargés automatiquement au premier lancement.
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
