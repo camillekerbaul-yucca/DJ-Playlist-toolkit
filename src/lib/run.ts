@@ -47,6 +47,9 @@ export function buildSldlArgs(opts: {
   } else {
     args.push("--format", "mp3", "--pref-format", "mp3", "--min-bitrate", "320");
   }
+  // By default sldl only *prefers* the right length, and would take a 1-minute
+  // intro for a 7-minute track. Tracks without a known length are not affected.
+  args.push("--length-tol", "15");
   if (opts.source === "youtube") args.push("--yt-parse", "--yt-id-col", "YT Id");
   // On SoundCloud the "artist" is often just the uploader (a label, a blog…).
   if (opts.source === "soundcloud") args.push("--artist-maybe-wrong");

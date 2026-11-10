@@ -233,6 +233,16 @@ struct FallbackResult {
     error: Option<String>,
 }
 
+/// The audio file yt-dlp wrote as `<base>.<ext>` (thumbnails are embedded and removed).
+fn find_with_stem(base: &Path) -> Option<String> {
+    let (dir, stem) = (base.parent()?, base.file_name()?);
+    std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find_map(|p| {
+        let ext = p.extension()?.to_str()?.to_lowercase();
+        let audio = !["jpg", "jpeg", "png", "webp", "part", "ytdl", "tmp"].contains(&ext.as_str());
+        (audio && p.file_stem()? == stem && p.is_file()).then(|| p.to_string_lossy().into_owned())
+    })
+}
+
 /// Downloads tracks Soulseek did not have straight from SoundCloud with yt-dlp.
 /// Files get a "(SC)" suffix so their lower quality stays visible in rekordbox.
 #[tauri::command]
@@ -278,7 +288,9 @@ async fn soundcloud_fallback(
         let out = child.wait_with_output().await.map_err(|e| e.to_string())?;
         *job.pid.lock().map_err(|e| e.to_string())? = None;
 
-        let path = String::from_utf8_lossy(&out.stdout).lines().last().map(|l| l.trim().to_string());
+        // yt-dlp prints the path in the console code page on Windows, which mangles
+        // emojis and other characters of the folder name: look for the file instead.
+        let path = out.status.success().then(|| find_with_stem(&base)).flatten();
         let result = match (out.status.success(), path) {
             (true, Some(p)) if !p.is_empty() => FallbackResult { key: item.key, path: Some(p), error: None },
             _ => FallbackResult {
@@ -490,6 +502,18 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finds_fallback_file_in_emoji_folder() {
+        let dir = std::env::temp_dir().join("djpt-test ⛵ SVP 🌞");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Nu - Maldidi (SC).jpg"), b"x").unwrap();
+        std::fs::write(dir.join("Nu - Maldidi (SC).m4a"), b"x").unwrap();
+        let found = find_with_stem(&dir.join("Nu - Maldidi (SC)")).unwrap();
+        assert!(found.ends_with("Nu - Maldidi (SC).m4a") && Path::new(&found).exists());
+        assert!(find_with_stem(&dir.join("Other (SC)")).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     use super::*;
 
     #[test]

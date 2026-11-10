@@ -114,6 +114,7 @@ button:disabled { cursor: not-allowed; }
 /* ── Run ────────────────────────────────────────────────── */
 .bar { height: 8px; border-radius: 999px; background: var(--line); overflow: hidden; }
 .bar > div { height: 100%; background: var(--accent); border-radius: 999px; transition: width .35s ease; }
+.run-list { flex: none; }
 .run-row { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 11px 16px; border-bottom: 1px solid #1d1d22; }
 .run-row:last-child { border-bottom: none; }
 .status { display: inline-flex; align-items: center; padding: 5px 10px; border-radius: 999px; font-size: 12px; font-weight: 500; white-space: nowrap; background: #1f1f24; color: var(--muted); }

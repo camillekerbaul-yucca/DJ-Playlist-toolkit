@@ -102,7 +102,7 @@ export function RunScreen({ name, dir, rows, stage, stageDetail, logs, error, on
         </div>
       )}
 
-      <div className="list">
+      <div className="list run-list">
         {rows.map((r, i) => {
           const s = statusOf(r);
           const dim = r.phase === "missing" || r.phase === "cancelled";

@@ -64,10 +64,19 @@ pub async fn resolve(app: &tauri::AppHandle, url: &str) -> Result<Playlist, Stri
 /// Splits "Artist - Title" (also with en/em dashes). None when there is no separator.
 pub fn split_artist_title(s: &str) -> Option<(String, String)> {
     for sep in [" - ", " – ", " — "] {
-        if let Some((a, t)) = s.split_once(sep) {
-            let (a, t) = (a.trim(), t.trim());
-            if !a.is_empty() && !t.is_empty() {
-                return Some((a.to_string(), t.to_string()));
+        // Ignore separators inside brackets: "A -b (C - D)" is not artist "A -b (C".
+        let mut depth = 0i32;
+        for (i, c) in s.char_indices() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                _ if depth == 0 && s[i..].starts_with(sep) => {
+                    let (a, t) = (s[..i].trim(), s[i + sep.len()..].trim());
+                    if !a.is_empty() && !t.is_empty() {
+                        return Some((a.to_string(), t.to_string()));
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -350,6 +359,8 @@ mod tests {
     fn splits_artist_title() {
         assert_eq!(split_artist_title("Papa Jazz - ppppuuunnntttaaaa (050)"), Some(("Papa Jazz".into(), "ppppuuunnntttaaaa (050)".into())));
         assert_eq!(split_artist_title("Soma"), None);
+        assert_eq!(split_artist_title("Viken Arman -lose You Self (Amram Solar - re)"), None);
+        assert_eq!(split_artist_title("Rosas (NU Remix) - Viken Arman"), Some(("Rosas (NU Remix)".into(), "Viken Arman".into())));
     }
 
     #[test]
