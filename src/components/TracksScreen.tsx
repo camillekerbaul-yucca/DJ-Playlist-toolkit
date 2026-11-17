@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Playlist, Quality } from "../lib/types";
-import { formatLength, formatTotal, MIX_SECONDS } from "../lib/run";
+import { formatLength, formatTotal, isSet } from "../lib/run";
 import { SOURCES } from "./SourceScreen";
 import { DownloadIcon } from "./Icons";
 
@@ -27,6 +27,9 @@ export function TracksScreen({ playlist, selected, setSelected, options, setOpti
   const count = selected.filter(Boolean).length;
   const total = playlist.tracks.reduce((a, t, i) => a + (selected[i] ? t.length ?? 0 : 0), 0);
   const allOn = count === playlist.tracks.length;
+  const sets = playlist.tracks.map((t) => isSet(t));
+  const setCount = sets.filter(Boolean).length;
+  const setsOn = sets.some((s, i) => s && selected[i]);
   const canStart = count > 0 && options.name.trim().length > 0 && options.outputDir.trim().length > 0;
   const set = (patch: Partial<RunOptions>) => setOptions({ ...options, ...patch });
 
@@ -43,7 +46,7 @@ export function TracksScreen({ playlist, selected, setSelected, options, setOpti
           <label className="label" htmlFor="pname">Nom du dossier</label>
           <input id="pname" className="input title" value={options.name} onChange={(e) => set({ name: e.target.value })} />
           <span className="small" style={{ fontSize: 13 }}>
-            {src.label} · {playlist.tracks.length} morceaux · {formatTotal(total)} sélectionnés
+            {src.label} · {playlist.tracks.length} morceaux{total > 0 && ` · ${formatTotal(total)} sélectionnés`}
           </span>
         </div>
         <button className="btn" onClick={onBack}>Changer de lien</button>
@@ -57,9 +60,16 @@ export function TracksScreen({ playlist, selected, setSelected, options, setOpti
         <div className="list">
           <div className="list-head">
             <span className="small" style={{ fontSize: 13 }}>{count} sur {playlist.tracks.length} sélectionnés</span>
-            <button className="link" style={{ textDecoration: "none" }} onClick={() => setSelected(playlist.tracks.map(() => !allOn))}>
-              {allOn ? "Tout désélectionner" : "Tout sélectionner"}
-            </button>
+            <span className="row gap-18">
+              {setCount > 0 && (
+                <button className="link" style={{ textDecoration: "none" }} onClick={() => setSelected(selected.map((v, i) => (sets[i] ? !setsOn : v)))}>
+                  {setsOn ? `Exclure les sets (${setCount})` : `Inclure les sets (${setCount})`}
+                </button>
+              )}
+              <button className="link" style={{ textDecoration: "none" }} onClick={() => setSelected(playlist.tracks.map(() => !allOn))}>
+                {allOn ? "Tout désélectionner" : "Tout sélectionner"}
+              </button>
+            </span>
           </div>
           <div className="list-body">
             {playlist.tracks.map((t, i) => (
@@ -69,7 +79,7 @@ export function TracksScreen({ playlist, selected, setSelected, options, setOpti
                 <span className="stack" style={{ gap: 2, minWidth: 0 }}>
                   <span className="name ellipsis">
                     {t.title}
-                    {(t.length ?? 0) >= MIX_SECONDS && <span className="tag">mix</span>}
+                    {isSet(t) && <span className="tag">set</span>}
                   </span>
                   <span className="small ellipsis">{t.artist}</span>
                 </span>

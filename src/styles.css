@@ -61,6 +61,7 @@ button:disabled { cursor: not-allowed; }
 .input { height: 48px; padding: 0 14px; border-radius: 12px; background: var(--raised); border: 1px solid var(--line-strong); color: var(--text); min-width: 0; }
 .input:focus { outline: none; border-color: var(--accent); }
 .input.mono { font-size: 13px; }
+.input.textarea { height: auto; min-height: 170px; padding: 12px 14px; line-height: 1.6; resize: vertical; font-family: var(--mono); }
 .input.title { height: 44px; background: transparent; font: 600 22px var(--display); }
 
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 40px; padding: 0 16px; border-radius: 10px; border: 1px solid var(--line-strong); background: var(--raised); color: var(--text-2); font-size: 13px; white-space: nowrap; }

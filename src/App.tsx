@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { AppConfig, IndexEntry, Playlist, RunRow, ToolStatus, Track } from "./lib/types";
-import { applyIndex, applyLogLine, buildSldlArgs, joinPath, MIX_SECONDS, rowKey, sanitizeName } from "./lib/run";
+import { applyIndex, applyLogLine, buildSldlArgs, isSet, joinPath, rowKey, sanitizeName } from "./lib/run";
 import { Setup } from "./components/Setup";
 import { Settings } from "./components/Settings";
 import { SourceScreen } from "./components/SourceScreen";
@@ -72,8 +72,8 @@ export default function App() {
 
   const loadPlaylist = (p: Playlist) => {
     setPlaylist(p);
-    // DJ mixes (30 min+) are rarely what you want on Soulseek: off by default.
-    setSelected(p.tracks.map((t) => (t.length ?? 0) < MIX_SECONDS));
+    // DJ sets / mixes / podcasts are rarely what you want: off by default.
+    setSelected(p.tracks.map((t) => !isSet(t)));
     setOptions((o) => ({ ...o, name: p.name }));
     setScreen("tracks");
   };

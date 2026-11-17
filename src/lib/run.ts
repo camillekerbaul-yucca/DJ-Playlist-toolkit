@@ -23,8 +23,23 @@ export function formatTotal(sec: number): string {
   return h > 0 ? `${h} h ${String(m).padStart(2, "0")}` : `${m} min`;
 }
 
-/** Tracks this long are DJ mixes, not tracks: unselected by default. */
-export const MIX_SECONDS = 30 * 60;
+/** Anything this long is a DJ set, whatever its title. */
+export const MIX_SECONDS = 25 * 60;
+/** From this length, a title that reads like a set marks a set. */
+const MAYBE_SET_SECONDS = 12 * 60;
+// Words that make a long upload a set. "@" covers "Artist @ Venue".
+const SET_WORDS = /\b(sets?|mix ?tape|podcast|boiler ?room|radio|show|b2b|live (at|from|in)|recorded (at|live)|sessions?|episode|ep\.? ?\d+|vol\.? ?\d+)\b|#\s?\d+|@/i;
+// "Original Mix" / "Extended Mix" / "Remix" are tracks: removed before looking for a bare "mix".
+const TRACK_MIX = /\b(original|extended|club|radio|dub|vocal|instrumental|edit)[ -]?mix\b|\bremix\b/gi;
+
+/** DJ sets, mixes, podcasts: unselected by default, tagged "set" in the list. */
+export function isSet(t: { title: string; length: number | null }): boolean {
+  const len = t.length ?? 0;
+  if (len >= MIX_SECONDS) return true;
+  if (len < MAYBE_SET_SECONDS) return false;
+  const title = t.title.replace(TRACK_MIX, "");
+  return SET_WORDS.test(title) || /\bmix\b/i.test(title);
+}
 
 export function buildSldlArgs(opts: {
   csvPath: string;

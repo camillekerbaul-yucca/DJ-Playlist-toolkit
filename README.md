@@ -26,7 +26,8 @@ Download the latest installer from the [Releases](../../releases/latest) page:
    - **Spotify**: playlist or album link. No login needed, but only the first 100 tracks are read. For longer playlists, export a CSV from [exportify.net](https://exportify.net) and drop it on the app.
    - **SoundCloud**: playlist, track, or a profile's likes (`https://soundcloud.com/<user>/likes`).
    - **YouTube**: playlist link.
-2. Pick the tracks (DJ mixes of 30 min or more are unticked by default) and the folder name.
+   - **Plain text**: "Ou colle une liste de morceaux en texte", one track per line as `Title - Artist` or `Artist - Title` (a switch picks the order). Leading numbers and timestamps are ignored.
+2. Pick the tracks and the folder name. DJ sets are unticked by default and tagged "set": anything 25 min or longer, or 12 min or longer with a set-like title (set, mix, podcast, b2b, live at, @ venue…). "Inclure les sets" ticks them back.
 3. Choose the quality: **FLAC / WAV** (a 320 kbps MP3 is accepted only when no lossless file exists) or **MP3 320**.
 4. Optionally:
    - **Convertir en AIFF Pioneer**: AIFF 16-bit / 44.1 kHz with title, artist and cover art. MP3s stay MP3.

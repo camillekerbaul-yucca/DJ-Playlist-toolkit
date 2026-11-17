@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { Playlist, Source } from "../lib/types";
 import { parsePlaylistCsv } from "../lib/csv";
+import { parseTextPlaylist, type LineOrder } from "../lib/text";
 import { FileIcon } from "./Icons";
 
 export const SOURCES: Record<Source, { label: string; short: string; color: string }> = {
@@ -10,6 +11,7 @@ export const SOURCES: Record<Source, { label: string; short: string; color: stri
   soundcloud: { label: "SoundCloud", short: "SC", color: "#ffa668" },
   youtube: { label: "YouTube", short: "YT", color: "#ff8a8a" },
   csv: { label: "CSV", short: "CSV", color: "#b4b4bc" },
+  text: { label: "Liste texte", short: "TXT", color: "#b4b4bc" },
 };
 
 function detect(url: string): Source | null {
@@ -26,6 +28,15 @@ export function SourceScreen({ onLoaded }: { onLoaded: (p: Playlist) => void }) 
   const [error, setError] = useState<string | null>(null);
   const [over, setOver] = useState(false);
   const detected = detect(url);
+  const [textOpen, setTextOpen] = useState(false);
+  const [text, setText] = useState("");
+  const [order, setOrder] = useState<LineOrder>("title-artist");
+  const textTracks = parseTextPlaylist(text, order);
+
+  const loadText = () => {
+    if (!textTracks.length) return;
+    onLoaded({ name: "Playlist texte", source: "text", tracks: textTracks, truncated: false });
+  };
 
   const analyse = async () => {
     if (!url.trim() || loading) return;
@@ -114,6 +125,32 @@ export function SourceScreen({ onLoaded }: { onLoaded: (p: Playlist) => void }) 
           <span className="small">Pour une playlist Spotify de plus de 100 morceaux (export Exportify).</span>
         </span>
       </button>
+
+      {!textOpen ? (
+        <button type="button" className="link" style={{ alignSelf: "flex-start" }} onClick={() => setTextOpen(true)}>
+          Ou colle une liste de morceaux en texte
+        </button>
+      ) : (
+        <div className="stack gap-10">
+          <div className="row gap-10" style={{ justifyContent: "space-between", alignItems: "flex-end" }}>
+            <label className="label" htmlFor="tracklist">Liste de morceaux, un par ligne</label>
+            <div className="segmented" role="group" aria-label="Ordre sur chaque ligne" style={{ flex: "0 1 320px" }}>
+              <button type="button" aria-pressed={order === "title-artist"} onClick={() => setOrder("title-artist")}>Titre - Artiste</button>
+              <button type="button" aria-pressed={order === "artist-title"} onClick={() => setOrder("artist-title")}>Artiste - Titre</button>
+            </div>
+          </div>
+          <textarea id="tracklist" className="input mono textarea" rows={8} value={text} autoFocus spellCheck={false}
+            onChange={(e) => setText(e.target.value)}
+            placeholder={order === "title-artist" ? "Maghreb (Original Mix) - Bernstein\nLom - Ninze & Okaxy\n…" : "Bernstein - Maghreb (Original Mix)\nNinze & Okaxy - Lom\n…"} />
+          <div className="row gap-10" style={{ justifyContent: "space-between" }}>
+            <span className="small">
+              {textTracks.length ? `${textTracks.length} morceau${textTracks.length > 1 ? "x" : ""}` : "Les numéros (« 01. ») et minutages (« [12:30] ») en début de ligne sont ignorés."}
+              {textTracks.length > 0 && textTracks[0].artist && ` · ex. artiste « ${textTracks[0].artist} », titre « ${textTracks[0].title} »`}
+            </span>
+            <button type="button" className="btn primary" disabled={!textTracks.length} onClick={loadText}>Continuer</button>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

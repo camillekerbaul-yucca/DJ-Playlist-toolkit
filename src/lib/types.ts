@@ -1,4 +1,4 @@
-export type Source = "spotify" | "soundcloud" | "youtube" | "csv";
+export type Source = "spotify" | "soundcloud" | "youtube" | "csv" | "text";
 
 /** Mirrors `sources::Track` in Rust. `length` is in seconds. */
 export interface Track {
