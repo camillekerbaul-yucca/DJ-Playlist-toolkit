@@ -30,10 +30,11 @@ Download the latest installer from the [Releases](../../releases/latest) page:
 2. Pick the tracks and the folder name. DJ sets are unticked by default and tagged "set": anything 25 min or longer, or 12 min or longer with a set-like title (set, mix, podcast, b2b, live at, @ venue…). "Inclure les sets" ticks them back.
 3. Choose the quality: **FLAC / WAV** (a 320 kbps MP3 is accepted only when no lossless file exists) or **MP3 320**.
 4. Optionally:
-   - **Convertir en AIFF Pioneer**: AIFF 16-bit / 44.1 kHz with title, artist and cover art. MP3s stay MP3.
-   - **Secours SoundCloud** (SoundCloud sources): tracks not found on Soulseek are taken from SoundCloud (160 kbps), with `(SC)` in the file name.
+   - **Convertir en AIFF Pioneer**: AIFF 16-bit / 44.1 kHz with title, artist and cover art. Every FLAC / WAV / M4A in the folder is converted, earlier runs included. MP3s stay MP3.
+   - **Secours SoundCloud** (SoundCloud sources): tracks not found on Soulseek are taken from SoundCloud. The artist's original file (FLAC/WAV) when downloads are allowed and a SoundCloud token is set in ⚙, named normally; otherwise the 160 kbps stream, with `(SC)` in the file name.
    - **Secours YouTube** (YouTube sources): tracks not found on Soulseek are taken from YouTube as MP3 320 (YouTube audio is ~160 kbps at best), with `(YT)` in the file name.
-5. Enter your Soulseek account in ⚙ (a new username/password pair creates the account on first login).
+   - **Secours SoundCloud puis YouTube** (text lists): tracks not found on Soulseek are searched on SoundCloud, then YouTube. A result must carry the title and the artist's name, last 3 to 20 min, and not be a snippet/preview or another version (remix, live…). Tags are set to the list's artist and title.
+5. Enter your Soulseek account in ⚙ (a new username/password pair creates the account on first login). Optionally add your SoundCloud token (cookie `oauth_token` on soundcloud.com).
 6. Hit **Télécharger**. Files land in `Music/SLDL/<playlist name>/`.
 
 Running the same playlist again into the same folder only fetches tracks that are new or were missing.

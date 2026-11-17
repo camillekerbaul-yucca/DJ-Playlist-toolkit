@@ -5,7 +5,16 @@ import { CheckCircle } from "./Icons";
 
 export type Stage = "sldl" | "fallback" | "aiff" | "done" | "stopped" | "error";
 
-function statusOf(r: RunRow, web: string, webQ: string): { label: string; cls: string } {
+/** Where a fallback file came from, read from its name: lossy files carry
+ *  "(SC)" / "(YT)", a lossless SoundCloud original is named like a Soulseek file. */
+function webOrigin(file?: string): string {
+  const f = file ?? "";
+  if (/\(YT\)\.[^.]+$/.test(f)) return "YouTube · MP3 320";
+  if (/\(SC\)\.[^.]+$/.test(f)) return "SoundCloud 160k";
+  return `${extOf(f).toUpperCase()} · SoundCloud`;
+}
+
+function statusOf(r: RunRow, web: string): { label: string; cls: string } {
   if (r.converting) return { label: "Conversion AIFF…", cls: "live" };
   switch (r.phase) {
     case "wait": return { label: "En attente", cls: "" };
@@ -15,7 +24,11 @@ function statusOf(r: RunRow, web: string, webQ: string): { label: string; cls: s
     case "fallback": return { label: `${web}…`, cls: "dl" };
     case "missing": return { label: "Introuvable", cls: "bad" };
     case "cancelled": return { label: "Annulé", cls: "" };
-    case "sc": return { label: r.converted ? `AIFF · depuis ${webQ}` : webQ, cls: "sc" };
+    case "sc": {
+      const origin = webOrigin(r.file);
+      const lossless = !/^(YouTube|SoundCloud 160k)/.test(origin);
+      return { label: r.converted ? `AIFF${lossless ? " ✓" : ""} · depuis ${origin}` : origin, cls: lossless ? "ok" : "sc" };
+    }
     case "found": {
       const ext = extOf(r.file);
       if (r.converted) return { label: `AIFF ✓ · depuis ${ext.toUpperCase()}`, cls: "ok" };
@@ -38,8 +51,7 @@ export function RunScreen({ name, source, dir, rows, stage, stageDetail, logs, e
   onOpen: () => void;
   onReset: () => void;
 }) {
-  const web = source === "youtube" ? "YouTube" : "SoundCloud";
-  const webQ = source === "youtube" ? "YouTube · MP3 320" : "SoundCloud 160k";
+  const web = source === "youtube" ? "YouTube" : source === "text" ? "SoundCloud / YouTube" : "SoundCloud";
   const running = stage === "sldl" || stage === "fallback" || stage === "aiff";
   const settled = (r: RunRow) => ["found", "sc", "missing", "cancelled"].includes(r.phase) || (r.phase === "notfound" && stage !== "sldl");
   // While sldl runs, downloads are only known from its "Succeeded" lines.
@@ -107,7 +119,7 @@ export function RunScreen({ name, source, dir, rows, stage, stageDetail, logs, e
 
       <div className="list run-list">
         {rows.map((r, i) => {
-          const s = statusOf(r, web, webQ);
+          const s = statusOf(r, web);
           const dim = r.phase === "missing" || r.phase === "cancelled";
           return (
             <div key={r.key} className="run-row">

@@ -21,6 +21,8 @@ export interface AppConfig {
   username: string;
   password: string;
   output_dir: string;
+  /** Optional: lets the SoundCloud fallback get artists' original files (FLAC/WAV). */
+  sc_token: string;
 }
 
 export interface ToolStatus {

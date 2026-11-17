@@ -14,7 +14,7 @@ type Screen = "source" | "tracks" | "run";
 
 export default function App() {
   const [tools, setTools] = useState<ToolStatus | null>(null);
-  const [config, setConfig] = useState<AppConfig>({ username: "", password: "", output_dir: "" });
+  const [config, setConfig] = useState<AppConfig>({ username: "", password: "", output_dir: "", sc_token: "" });
   const [showSettings, setShowSettings] = useState(false);
 
   const [screen, setScreen] = useState<Screen>("source");
@@ -115,10 +115,12 @@ export default function App() {
       let current = applyIndex(rowsRef.current, entries);
       setRows(current);
 
-      // 2. SoundCloud / YouTube fallback for what Soulseek did not have
+      // 2. SoundCloud / YouTube fallback for what Soulseek did not have.
+      // Text lists have no track page: the backend searches SoundCloud, then YouTube.
+      const searched = playlist.source === "text";
       const webUrl = (t: Track) => t.url || (t.yt_id ? `https://www.youtube.com/watch?v=${t.yt_id}` : null);
-      const wanted = current.filter((r) => r.phase === "notfound" && webUrl(r.track));
-      const webSource = playlist.source === "soundcloud" || playlist.source === "youtube";
+      const wanted = current.filter((r) => r.phase === "notfound" && (searched || webUrl(r.track)));
+      const webSource = searched || playlist.source === "soundcloud" || playlist.source === "youtube";
       if (webSource && options.scFallback && wanted.length) {
         setStage("fallback");
         const results = await invoke<{ key: string; path: string | null }[]>("web_fallback", {
@@ -136,11 +138,11 @@ export default function App() {
       current = current.map((r) => (r.phase === "notfound" ? { ...r, phase: "missing" } : r));
       setRows(current);
 
-      // 3. AIFF for the CDJs
-      const files = current.filter((r) => r.file && (r.phase === "found" || r.phase === "sc")).map((r) => r.file!);
-      if (options.aiff && files.length) {
+      // 3. AIFF for the CDJs. An empty list converts every FLAC/WAV/M4A… in the
+      // folder: files skipped as "already there" or left by an earlier run too.
+      if (options.aiff) {
         setStage("aiff"); setStageDetail("");
-        await invoke("convert_to_aiff", { dir, files });
+        await invoke("convert_to_aiff", { dir, files: [] });
         if (stopped.current) return finishStopped();
       }
       setStageDetail("");

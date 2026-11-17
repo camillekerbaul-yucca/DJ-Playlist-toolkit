@@ -109,14 +109,16 @@ export function TracksScreen({ playlist, selected, setSelected, options, setOpti
             </span>
           </label>
 
-          {(playlist.source === "soundcloud" || playlist.source === "youtube") && (
+          {(playlist.source === "soundcloud" || playlist.source === "youtube" || playlist.source === "text") && (
             <label className="check">
               <input type="checkbox" checked={options.scFallback} onChange={() => set({ scFallback: !options.scFallback })} />
               <span className="stack" style={{ gap: 3 }}>
-                <span style={{ fontWeight: 500 }}>Secours {playlist.source === "youtube" ? "YouTube" : "SoundCloud"}</span>
+                <span style={{ fontWeight: 500 }}>Secours {playlist.source === "youtube" ? "YouTube" : playlist.source === "text" ? "SoundCloud puis YouTube" : "SoundCloud"}</span>
                 <span className="small">{playlist.source === "youtube"
                   ? "Si un morceau est introuvable sur Soulseek, le prendre sur YouTube en MP3 320 (qualité réelle ~160 kbps, fichier marqué « (YT) »)."
-                  : "Si un morceau est introuvable sur Soulseek, le prendre sur SoundCloud (160 kbps, fichier marqué « (SC) »)."}</span>
+                  : playlist.source === "text"
+                  ? "Si un morceau est introuvable sur Soulseek, le chercher sur SoundCloud, puis sur YouTube. Fichier original FLAC/WAV si l'artiste le propose, sinon 160 kbps marqué « (SC) » ou « (YT) »."
+                  : "Si un morceau est introuvable sur Soulseek, le prendre sur SoundCloud : fichier original FLAC/WAV si l'artiste le propose, sinon 160 kbps marqué « (SC) »."}</span>
               </span>
             </label>
           )}

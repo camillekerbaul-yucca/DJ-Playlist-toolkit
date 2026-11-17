@@ -25,6 +25,9 @@ pub struct AppConfig {
     pub username: String,
     pub password: String,
     pub output_dir: String,
+    /// SoundCloud oauth token: only logged-in users get artists' original files (FLAC/WAV).
+    #[serde(default)]
+    pub sc_token: String,
 }
 
 // ─── Tools ────────────────────────────────────────────────────────────────────
@@ -299,7 +302,8 @@ fn flatten_downloads(index: &Path) -> Result<usize, String> {
 #[derive(Deserialize)]
 struct FallbackItem {
     key: String,
-    url: String,
+    /// Track page for SoundCloud / YouTube playlists; none for text lists (searched).
+    url: Option<String>,
     artist: String,
     title: String,
 }
@@ -321,9 +325,255 @@ fn find_with_stem(base: &Path) -> Option<String> {
     })
 }
 
-/// Downloads tracks Soulseek did not have straight from SoundCloud or YouTube
-/// with yt-dlp. Files get a "(SC)" / "(YT)" suffix so their lower quality stays
-/// visible in rekordbox.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Site {
+    SoundCloud,
+    YouTube,
+}
+
+struct Candidate {
+    url: String,
+    title: String,
+    uploader: String,
+    duration: Option<f64>,
+}
+
+fn words(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Words that make a different version: a result carrying one the wanted title
+/// does not have ("Maghreb (KHRMN Remix)" for "Maghreb") is another track.
+const VERSION_WORDS: [&str; 12] = ["remix", "rmx", "edit", "rework", "bootleg", "vip", "dub", "live", "cover", "flip", "interpretation", "reinterpretation"];
+/// Labels upload 1-2 minute previews of their releases: never the track.
+const PREVIEW_WORDS: [&str; 6] = ["snippet", "snippets", "preview", "previews", "teaser", "excerpt"];
+/// Words too common to prove anything about a match.
+const FILLER_WORDS: [&str; 11] = ["original", "mix", "extended", "version", "feat", "ft", "featuring", "the", "a", "an", "and"];
+
+/// Edit distance with adjacent swaps ("antsryev" / "antsyrev" = 1).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for j in 0..=b.len() {
+        d[0][j] = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    d[a.len()][b.len()]
+}
+
+/// Same word, allowing a typo in longer words (Antsryev / Antsyrev, Spectial / Spectral).
+fn same_word(a: &str, b: &str) -> bool {
+    let n = a.chars().count().min(b.chars().count());
+    // Short words must match exactly: "ruina" is not "raina", "simao" is not "simak".
+    a == b || (n >= 6 && edit_distance(a, b) <= 1) || (n >= 8 && edit_distance(a, b) <= 2)
+}
+
+/// A search result is the wanted track when:
+/// - it lasts 3 to 20 min and is not labelled a snippet / preview;
+/// - its title holds every significant word of the wanted title, and no
+///   version word ("remix", "live"…) the wanted title does not have;
+/// - the full name of one of the artists appears in its title or uploader
+///   (one artist word is enough when the title itself is distinctive).
+fn is_match(artist: &str, title: &str, c: &Candidate) -> bool {
+    if let Some(d) = c.duration {
+        if !(180.0..=1200.0).contains(&d) {
+            return false;
+        }
+    }
+    let result_title = words(&c.title);
+    let everywhere = words(&format!("{} {}", c.title, c.uploader));
+    let in_title = |w: &str| result_title.iter().any(|h| same_word(h, w));
+    let anywhere = |w: &str| everywhere.iter().any(|h| same_word(h, w));
+
+    if PREVIEW_WORDS.iter().any(|p| result_title.iter().any(|w| w == p)) {
+        return false;
+    }
+    let wanted = words(title);
+    let significant: Vec<&String> = wanted.iter().filter(|w| !FILLER_WORDS.contains(&w.as_str())).collect();
+    if significant.is_empty() || !significant.iter().all(|w| in_title(w)) {
+        return false;
+    }
+    if VERSION_WORDS.iter().any(|v| result_title.iter().any(|w| w == v) && !wanted.iter().any(|w| w == v)) {
+        return false;
+    }
+
+    // "Jinger, Traumer" / "A & B" / "A feat. B": each artist on its own.
+    let artists: Vec<Vec<String>> = artist
+        .split([',', '&', '/', ';'])
+        .flat_map(|a| a.split(" feat").flat_map(|a| a.split(" x ")))
+        .map(|a| words(a).into_iter().filter(|w| w.len() > 1 && !FILLER_WORDS.contains(&w.as_str())).collect::<Vec<_>>())
+        .filter(|a| !a.is_empty())
+        .collect();
+    if artists.is_empty() {
+        return true;
+    }
+    let full_artist = artists.iter().any(|a| a.iter().all(|w| anywhere(w)));
+    let distinctive_title = significant.iter().filter(|w| w.chars().count() >= 4).count() >= 2;
+    let some_artist_word = artists.iter().flatten().any(|w| anywhere(w));
+    full_artist || (distinctive_title && some_artist_word)
+}
+
+/// Runs yt-dlp, keeping its pid so "Arrêter" can kill it.
+async fn run_ytdlp(job: &Job, mut cmd: tokio::process::Command) -> Result<std::process::Output, String> {
+    let child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("yt-dlp : {e}"))?;
+    *job.pid.lock().map_err(|e| e.to_string())? = child.id();
+    let out = child.wait_with_output().await.map_err(|e| e.to_string());
+    *job.pid.lock().map_err(|e| e.to_string())? = None;
+    out
+}
+
+async fn search(job: &Job, ytdlp: &str, site: Site, artist: &str, title: &str) -> Result<Vec<Candidate>, String> {
+    let prefix = if site == Site::SoundCloud { "scsearch10" } else { "ytsearch10" };
+    let mut cmd = tools::hidden_command(ytdlp);
+    cmd.args(["--flat-playlist", "-J", "--no-warnings"]).arg(format!("{prefix}:{artist} {title}"));
+    let out = run_ytdlp(job, cmd).await?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    Ok(v["entries"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    Some(Candidate {
+                        url: e["url"].as_str()?.to_string(),
+                        title: e["title"].as_str().unwrap_or("").to_string(),
+                        uploader: e["uploader"].as_str().or(e["channel"].as_str()).unwrap_or("").to_string(),
+                        duration: e["duration"].as_f64(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+const LOSSLESS: [&str; 4] = ["flac", "wav", "aiff", "aif"];
+
+/// Downloads one track page into `dir` as "<name> (SC|YT).<ext>". A lossless
+/// SoundCloud original (FLAC/WAV/AIFF) loses the suffix: it is as good as Soulseek.
+#[allow(clippy::too_many_arguments)]
+async fn fetch(
+    job: &Job,
+    ytdlp: &str,
+    ffmpeg: Option<&String>,
+    site: Site,
+    url: &str,
+    dir: &str,
+    name: &str,
+    sc_token: &str,
+) -> Result<String, String> {
+    let with_login = site == Site::SoundCloud && !sc_token.is_empty();
+    match fetch_once(job, ytdlp, ffmpeg, site, url, dir, name, with_login.then_some(sc_token)).await {
+        // An expired or wrong token must not cost the track: retry as a guest (160k stream).
+        Err(_) if with_login && !job.cancelled.load(Ordering::SeqCst) => {
+            fetch_once(job, ytdlp, ffmpeg, site, url, dir, name, None).await
+        }
+        r => r,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_once(
+    job: &Job,
+    ytdlp: &str,
+    ffmpeg: Option<&String>,
+    site: Site,
+    url: &str,
+    dir: &str,
+    name: &str,
+    sc_token: Option<&str>,
+) -> Result<String, String> {
+    let suffix = if site == Site::YouTube { "(YT)" } else { "(SC)" };
+    let base = Path::new(dir).join(sanitize_filename(&format!("{name} {suffix}")));
+    let mut cmd = tools::hidden_command(ytdlp);
+    cmd.args(["--no-playlist", "--no-progress", "--no-warnings"]);
+    if site == Site::YouTube {
+        // YouTube audio tops out around 160 kbps; MP3 320 so every CDJ reads it.
+        cmd.args(["-f", "bestaudio", "-x", "--audio-format", "mp3", "--audio-quality", "320K", "--postprocessor-args", "ExtractAudio:-ar 44100"]);
+    } else {
+        // SoundCloud's own AAC/MP3 streams, or the original file when the artist allows downloads
+        cmd.args(["--extractor-args", "soundcloud:formats=*_aac,*_mp3", "-f", "bestaudio"]);
+        if let Some(token) = sc_token {
+            cmd.args(["--username", "oauth", "--password", token]);
+        }
+    }
+    cmd.args([
+        "--embed-metadata", "--embed-thumbnail", "--convert-thumbnails", "jpg",
+        // "Artist - Title" uploads: put the artist in the artist tag
+        "--parse-metadata", "title:%(artist)s - %(title)s",
+        "-o",
+    ]);
+    cmd.arg(format!("{}.%(ext)s", base.to_string_lossy()));
+    if let Some(ff) = ffmpeg {
+        cmd.arg("--ffmpeg-location").arg(ff);
+    }
+    cmd.arg(url);
+    let out = run_ytdlp(job, cmd).await?;
+
+    // yt-dlp prints the path in the console code page on Windows, which mangles
+    // emojis and other characters of the folder name: look for the file instead.
+    let found = out.status.success().then(|| find_with_stem(&base)).flatten();
+    let Some(path) = found else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(err.lines().filter(|l| l.contains("ERROR")).last().unwrap_or("échec").to_string());
+    };
+    let p = Path::new(&path);
+    let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("").to_lowercase();
+    if site == Site::SoundCloud && LOSSLESS.contains(&ext.as_str()) {
+        let plain = Path::new(dir).join(format!("{}.{ext}", sanitize_filename(name)));
+        if !plain.exists() && std::fs::rename(p, &plain).is_ok() {
+            return Ok(plain.to_string_lossy().into_owned());
+        }
+    }
+    Ok(path)
+}
+
+/// Sets the artist / title tags to the playlist's own values: uploads often read
+/// "PREMIERE: Artist" / "Title [CAT001]". Audio and cover are copied untouched.
+async fn retag(ffmpeg: &str, path: &str, artist: &str, title: &str) {
+    let src = Path::new(path);
+    let ext = src.extension().and_then(|x| x.to_str()).unwrap_or("").to_lowercase();
+    let tmp = src.with_extension(format!("retag.{ext}"));
+    let mut cmd = tools::hidden_command(ffmpeg);
+    cmd.args(["-loglevel", "error", "-y", "-i"])
+        .arg(src)
+        .args(["-map", "0", "-c", "copy", "-map_metadata", "0"])
+        .arg("-metadata").arg(format!("artist={artist}"))
+        .arg("-metadata").arg(format!("title={title}"));
+    if ext == "mp3" {
+        cmd.args(["-id3v2_version", "3"]);
+    }
+    cmd.arg(&tmp).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let ok = cmd.status().await.map(|s| s.success()).unwrap_or(false) && tmp.is_file();
+    if ok && std::fs::remove_file(src).is_ok() {
+        std::fs::rename(&tmp, src).ok();
+    } else {
+        std::fs::remove_file(&tmp).ok();
+    }
+}
+
+/// Fetches tracks Soulseek did not have from SoundCloud or YouTube with yt-dlp.
+/// Playlist tracks come with their page; text-list tracks are searched on
+/// SoundCloud, then YouTube. Lossy files get "(SC)" / "(YT)" so their lower
+/// quality stays visible in rekordbox.
 #[tauri::command]
 async fn web_fallback(
     app: AppHandle,
@@ -332,74 +582,55 @@ async fn web_fallback(
     source: String,
     items: Vec<FallbackItem>,
 ) -> Result<Vec<FallbackResult>, String> {
-    let youtube = source == "youtube";
     let ytdlp = tools::find(&app, Tool::YtDlp).ok_or("yt-dlp introuvable. Relance l'application.")?;
     let ffmpeg = tools::find(&app, Tool::Ffmpeg);
+    let sc_token = get_config(app.clone()).map(|c| c.sc_token).unwrap_or_default();
     let mut results = Vec::new();
     for item in items {
         if job.cancelled.load(Ordering::SeqCst) {
             break;
         }
         app.emit("fallback-progress", serde_json::json!({ "key": item.key, "status": "running" })).ok();
-        let name = if youtube {
-            // YouTube: the video title is usually "Artist - Title", the channel a label.
-            match sources::split_artist_title(&item.title) {
-                Some((a, t)) => format!("{a} - {t} (YT)"),
-                None if item.artist.is_empty() => format!("{} (YT)", item.title),
-                None => format!("{} - {} (YT)", item.artist, item.title),
-            }
-        } else {
-            format!("{} - {} (SC)", item.artist, item.title)
-        };
-        let base = Path::new(&dir).join(sanitize_filename(&name));
-        let mut cmd = tools::hidden_command(&ytdlp);
-        cmd.args(["--no-playlist", "--no-progress", "--no-warnings"]);
-        if youtube {
-            // YouTube audio tops out around 160 kbps; MP3 320 so every CDJ reads it.
-            cmd.args(["-f", "bestaudio", "-x", "--audio-format", "mp3", "--audio-quality", "320K", "--postprocessor-args", "ExtractAudio:-ar 44100"]);
-        } else {
-            // SoundCloud's own AAC/MP3 streams, or the original file when the artist allows downloads
-            cmd.args(["--extractor-args", "soundcloud:formats=*_aac,*_mp3", "-f", "bestaudio"]);
-        }
-        cmd.args([
-            "--embed-metadata", "--embed-thumbnail", "--convert-thumbnails", "jpg",
-            // "Artist - Title" uploads: put the artist in the artist tag
-            "--parse-metadata", "title:%(artist)s - %(title)s",
-            "--print", "after_move:filepath",
-            "-o",
-        ]);
-        cmd.arg(format!("{}.%(ext)s", base.to_string_lossy()));
-        if let Some(ff) = &ffmpeg {
-            cmd.arg("--ffmpeg-location").arg(ff);
-        }
-        cmd.arg(&item.url);
-        let child = cmd
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("yt-dlp : {e}"))?;
-        *job.pid.lock().map_err(|e| e.to_string())? = child.id();
-        let out = child.wait_with_output().await.map_err(|e| e.to_string())?;
-        *job.pid.lock().map_err(|e| e.to_string())? = None;
+        let plain_name = if item.artist.is_empty() { item.title.clone() } else { format!("{} - {}", item.artist, item.title) };
 
-        // yt-dlp prints the path in the console code page on Windows, which mangles
-        // emojis and other characters of the folder name: look for the file instead.
-        let path = out.status.success().then(|| find_with_stem(&base)).flatten();
-        let result = match (out.status.success(), path) {
-            (true, Some(p)) if !p.is_empty() => FallbackResult { key: item.key, path: Some(p), error: None },
-            _ => FallbackResult {
-                key: item.key,
-                path: None,
-                error: Some(
-                    String::from_utf8_lossy(&out.stderr)
-                        .lines()
-                        .filter(|l| l.contains("ERROR"))
-                        .last()
-                        .unwrap_or("échec")
-                        .to_string(),
-                ),
-            },
+        let outcome: Result<String, String> = match &item.url {
+            Some(url) if source == "youtube" => {
+                // YouTube playlist: the video title is usually "Artist - Title", the channel a label.
+                let name = match sources::split_artist_title(&item.title) {
+                    Some((a, t)) => format!("{a} - {t}"),
+                    None => plain_name.clone(),
+                };
+                fetch(&job, &ytdlp, ffmpeg.as_ref(), Site::YouTube, url, &dir, &name, &sc_token).await
+            }
+            Some(url) => fetch(&job, &ytdlp, ffmpeg.as_ref(), Site::SoundCloud, url, &dir, &plain_name, &sc_token).await,
+            None => {
+                let mut outcome = Err("introuvable sur SoundCloud et YouTube".to_string());
+                for site in [Site::SoundCloud, Site::YouTube] {
+                    if job.cancelled.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let found = search(&job, &ytdlp, site, &item.artist, &item.title).await?;
+                    if let Some(c) = found.iter().find(|c| is_match(&item.artist, &item.title, c)) {
+                        outcome = fetch(&job, &ytdlp, ffmpeg.as_ref(), site, &c.url, &dir, &plain_name, &sc_token).await;
+                        if outcome.is_ok() {
+                            break;
+                        }
+                    }
+                }
+                outcome
+            }
+        };
+
+        // Playlist / text-list artist and title beat the uploader's tags. (A YouTube
+        // playlist only knows the channel, so its yt-dlp tags stay.)
+        if let (Ok(p), Some(ff)) = (&outcome, &ffmpeg) {
+            if source != "youtube" && !item.artist.is_empty() {
+                retag(ff, p, &item.artist, &item.title).await;
+            }
+        }
+        let result = match outcome {
+            Ok(p) => FallbackResult { key: item.key, path: Some(p), error: None },
+            Err(e) => FallbackResult { key: item.key, path: None, error: Some(e) },
         };
         app.emit("fallback-progress", serde_json::json!({
             "key": result.key, "status": if result.path.is_some() { "ok" } else { "failed" }, "path": result.path
@@ -554,6 +785,7 @@ fn get_config(app: AppHandle) -> Result<AppConfig, String> {
         username: get("username").unwrap_or_default(),
         password: get("password").unwrap_or_default(),
         output_dir: get("output_dir").filter(|s| !s.is_empty()).unwrap_or(default_output),
+        sc_token: get("sc_token").unwrap_or_default(),
     })
 }
 
@@ -564,6 +796,7 @@ fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
     store.set("username", serde_json::Value::String(config.username));
     store.set("password", serde_json::Value::String(config.password));
     store.set("output_dir", serde_json::Value::String(config.output_dir));
+    store.set("sc_token", serde_json::Value::String(config.sc_token.trim().to_string()));
     store.save().map_err(|e| e.to_string())
 }
 
@@ -597,6 +830,109 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    /// Live check of the text-list fallback search:
+    /// DJPT_YTDLP=<yt-dlp> DJPT_LIST=<file of "artist<TAB>title" lines> cargo test --lib live_fallback_search -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_fallback_search() {
+        let ytdlp = std::env::var("DJPT_YTDLP").expect("DJPT_YTDLP");
+        let list = std::fs::read_to_string(std::env::var("DJPT_LIST").expect("DJPT_LIST")).unwrap();
+        let job = Job::default();
+        let (mut sc, mut yt, mut none) = (0, 0, 0);
+        for line in list.lines().filter(|l| !l.trim().is_empty()) {
+            let (artist, title) = line.split_once('\t').unwrap_or(("", line));
+            let mut hit = None;
+            for site in [Site::SoundCloud, Site::YouTube] {
+                let found = search(&job, &ytdlp, site, artist, title).await.unwrap_or_default();
+                if let Some(c) = found.into_iter().find(|c| is_match(artist, title, c)) {
+                    hit = Some((site, c));
+                    break;
+                }
+            }
+            match hit {
+                Some((site, c)) => {
+                    if site == Site::SoundCloud { sc += 1 } else { yt += 1 }
+                    let tag = if site == Site::SoundCloud { "SC" } else { "YT" };
+                    println!("{tag}   {artist} - {title}  =>  {} [{}] {:.0}s  {}", c.title, c.uploader, c.duration.unwrap_or(0.0), c.url);
+                }
+                None => {
+                    none += 1;
+                    println!("--   {artist} - {title}");
+                }
+            }
+        }
+        println!("\nSoundCloud {sc} · YouTube {yt} · introuvables {none}");
+    }
+
+    /// Live run of the text-list fallback (search, download, retag) into a folder:
+    /// DJPT_YTDLP=… DJPT_FFMPEG=… DJPT_LIST=<"artist<TAB>title" lines> DJPT_DIR=<folder>
+    /// cargo test --lib live_fallback_download -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_fallback_download() {
+        let ytdlp = std::env::var("DJPT_YTDLP").expect("DJPT_YTDLP");
+        let ffmpeg = std::env::var("DJPT_FFMPEG").expect("DJPT_FFMPEG");
+        let dir = std::env::var("DJPT_DIR").expect("DJPT_DIR");
+        let list = std::fs::read_to_string(std::env::var("DJPT_LIST").expect("DJPT_LIST")).unwrap();
+        let job = Job::default();
+        for line in list.lines().filter(|l| !l.trim().is_empty()) {
+            let (artist, title) = line.split_once('\t').unwrap_or(("", line));
+            let name = if artist.is_empty() { title.to_string() } else { format!("{artist} - {title}") };
+            let mut outcome = Err("introuvable".to_string());
+            for site in [Site::SoundCloud, Site::YouTube] {
+                let found = search(&job, &ytdlp, site, artist, title).await.unwrap_or_default();
+                if let Some(c) = found.iter().find(|c| is_match(artist, title, c)) {
+                    outcome = fetch(&job, &ytdlp, Some(&ffmpeg), site, &c.url, &dir, &name, "").await;
+                    if outcome.is_ok() {
+                        break;
+                    }
+                }
+            }
+            if let Ok(p) = &outcome {
+                if !artist.is_empty() {
+                    retag(&ffmpeg, p, artist, title).await;
+                }
+            }
+            match outcome {
+                Ok(p) => println!("OK   {}", Path::new(&p).file_name().unwrap().to_string_lossy()),
+                Err(e) => println!("--   {name}  ({e})"),
+            }
+        }
+    }
+
+    #[test]
+    fn search_match_rules() {
+        let c = |title: &str, uploader: &str, duration: f64| Candidate { url: String::new(), title: title.into(), uploader: uploader.into(), duration: Some(duration) };
+        // Right track, with or without "Original Mix", artist in the title or as uploader
+        assert!(is_match("Bernstein", "Maghreb (Original Mix)", &c("Bernstein - Maghreb (Original Mix)", "Télér", 464.0)));
+        assert!(is_match("Bernstein", "Maghreb (Original Mix)", &c("Maghreb", "Bernstein", 465.0)));
+        assert!(is_match("Ninze & Okaxy", "Lom", &c("Ninze, Okaxy - Lom", "Custard", 451.0)));
+        assert!(is_match("Firesc", "Anitab Paradise", &c("Anitab Paradise", "Firesc - Topic", 556.0)));
+        // Typos between the list and the upload
+        assert!(is_match("Casper Shultz", "Stop Talking", &c("PREMIERE: Casper Schulz - Stop Talking [SVRSR023]", "Verzila", 393.0)));
+        assert!(is_match("Arkady Antsryev", "My Favela", &c("My Favela", "Arkady Antsyrev", 511.0)));
+        assert!(is_match("Ada Kelah", "Palatul De Clestar", &c("Ada Kaleh - Palatul De Clestar", "Spiri:tual", 546.0)));
+        // Another version, another track, a set, a preview
+        assert!(!is_match("Bernstein", "Maghreb (Original Mix)", &c("Bernstein - Maghreb (KHRMN Remix)", "Les Unicorn", 262.0)));
+        assert!(!is_match("Bernstein", "Maghreb", &c("Bernstein - Sahara", "Bernstein", 400.0)));
+        assert!(!is_match("Bernstein", "Maghreb", &c("Bernstein - Maghreb live at Burning Man", "x", 400.0)));
+        assert!(!is_match("Bernstein", "Maghreb", &c("Bernstein - Maghreb (DJ set)", "x", 3600.0)));
+        assert!(!is_match("Swoy", "Life Is Love", &c("A1 Swoy - Life Is Love (snippet)", "juuz records", 300.0)));
+        assert!(!is_match("SIMAO", "Ruina", &c("SIMAO (BR) - Ruina", "Solina", 120.0)));
+        assert!(!is_match("Ada Kelah", "Palatul De Clestar", &c("A2 Ada Kaleh - Palatul de cleștar", "Supersanity", 150.0)));
+        assert!(!is_match("Ada Kelah", "Palatul De Clestar", &c("Ada Kaleh - Palatul De Clestar (Spiri:tual re-interpretation)", "Spiri:tual", 546.0)));
+        // Near-miss words on short names
+        assert!(!is_match("SIMAO", "Ruina", &c("Raina Beete Jaaye.mp3", "Simak Naveed", 343.0)));
+        assert!(is_match("Barac", "Spectial Processor", &c("PREMIERE: Barac - Spectral Processor [MNRVRDG003]", "Rayzeh", 610.0)));
+        assert!(is_match("77 Mushrooms", "State Or Request", &c("Premiere: 77Mushrooms - State Or Request [MTRN006]", "Playform", 427.0)));
+        // Same first name, or the title only in the channel name
+        assert!(!is_match("Gianluca Pegoiani", "Come On", &c("Come On And Show 'Em", "Gianluca Vacchi", 222.0)));
+        assert!(!is_match("DIN", "Biotopia", &c("Gör din egen tornseglarholk", "Biotopia Uppsala", 313.0)));
+        assert!(!is_match("Bernstein", "Maghreb", &c("Maghreb", "Someone Else", 400.0)));
+        // The wanted remix is fine
+        assert!(is_match("Viken Arman", "Rosas (NU Remix)", &c("VIKEN ARMAN - Rosas (NU Remix)", "NU", 332.0)));
+    }
+
     #[test]
     fn flattens_sldl_subfolder() {
         let dir = std::env::temp_dir().join("djpt-flatten acid house case");
