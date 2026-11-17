@@ -91,12 +91,42 @@ pub fn emit_progress(app: &AppHandle, channel: &str, step: &str, percent: u32, m
 pub fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent("dj-playlist-toolkit")
+        .connect_timeout(std::time::Duration::from_secs(20))
         .build()
-        .map_err(|e| e.to_string())
+        .map_err(|e| net_err(&e))
+}
+
+/// reqwest's own message ("error sending request for url …") hides the cause
+/// (DNS, TLS, refused connection, firewall…): append the whole source chain.
+pub fn net_err(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut msg = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        msg.push_str(" → ");
+        msg.push_str(&s.to_string());
+        src = s.source();
+    }
+    msg
+}
+
+/// GET with up to 3 attempts on network errors (not on HTTP error statuses).
+async fn get_with_retry(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, String> {
+    let mut last = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(2 * attempt)).await;
+        }
+        match client.get(url).send().await {
+            Ok(r) => return Ok(r),
+            Err(e) => last = net_err(&e),
+        }
+    }
+    Err(format!("Connexion impossible à {url} : {last}"))
 }
 
 /// sldl is pinned: from 3.0 it was renamed "sockseek" with a different CLI.
-const SLDL_RELEASE: &str = "tags/v2.6.0";
+/// Its files are fetched by direct link, without the GitHub API.
+const SLDL_DOWNLOAD: &str = "https://github.com/fiso64/sldl/releases/download/v2.6.0";
 
 /// Finds the download URL of the first asset of a GitHub release ("latest" or
 /// "tags/<tag>") for which `pick` returns true (tried in order of `picks`).
@@ -106,14 +136,12 @@ async fn release_asset_url(
     release: &str,
     picks: &[&(dyn Fn(&str) -> bool + Sync)],
 ) -> Result<String, String> {
-    let release: serde_json::Value = client
-        .get(format!("https://api.github.com/repos/{repo}/releases/{release}"))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    let url = format!("https://api.github.com/repos/{repo}/releases/{release}");
+    let resp = get_with_retry(client, &url).await?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub a refusé la requête ({}) pour {repo}", resp.status()));
+    }
+    let release: serde_json::Value = resp.json().await.map_err(|e| net_err(&e))?;
     let assets = release["assets"].as_array().cloned().unwrap_or_default();
     for pick in picks {
         if let Some(url) = assets
@@ -134,15 +162,15 @@ async fn download_bytes(
     url: &str,
     channel: &str,
 ) -> Result<Vec<u8>, String> {
-    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+    let resp = get_with_retry(client, url).await?;
     if !resp.status().is_success() {
-        return Err(format!("Téléchargement refusé ({})", resp.status()));
+        return Err(format!("Téléchargement refusé ({}) : {url}", resp.status()));
     }
     let total = resp.content_length().unwrap_or(0);
     let mut bytes = Vec::with_capacity(total as usize);
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
+        let chunk = chunk.map_err(|e| net_err(&e))?;
         bytes.extend_from_slice(&chunk);
         if total > 0 {
             let pct = (bytes.len() as f64 / total as f64 * 80.0) as u32 + 5;
@@ -206,7 +234,7 @@ pub async fn install_sldl(app: &AppHandle) -> Result<(), String> {
     } else {
         "sldl_linux-x64.zip".to_string()
     };
-    let url = release_asset_url(&client, "fiso64/sldl", SLDL_RELEASE, &[&|n: &str| n == os_asset]).await?;
+    let url = format!("{SLDL_DOWNLOAD}/{os_asset}");
     emit_progress(app, ch, "downloading", 5, "Téléchargement…");
     let bytes = download_bytes(app, &client, &url, ch).await?;
     emit_progress(app, ch, "extracting", 88, "Extraction…");

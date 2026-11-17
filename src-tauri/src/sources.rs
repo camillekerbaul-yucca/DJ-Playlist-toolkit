@@ -35,7 +35,7 @@ fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(BROWSER_UA)
         .build()
-        .map_err(|e| e.to_string())
+        .map_err(|e| crate::tools::net_err(&e))
 }
 
 pub fn detect(url: &str) -> Option<&'static str> {
@@ -102,7 +102,7 @@ fn next_data(html: &str) -> Result<Value, String> {
     let start_tag = "<script id=\"__NEXT_DATA__\" type=\"application/json\">";
     let start = html.find(start_tag).ok_or("Page Spotify illisible (format inattendu)")? + start_tag.len();
     let end = html[start..].find("</script>").ok_or("Page Spotify illisible")? + start;
-    serde_json::from_str(&html[start..end]).map_err(|e| e.to_string())
+    serde_json::from_str(&html[start..end]).map_err(|e| crate::tools::net_err(&e))
 }
 
 async fn spotify(url: &str) -> Result<Playlist, String> {
@@ -111,12 +111,12 @@ async fn spotify(url: &str) -> Result<Playlist, String> {
         .get(format!("https://open.spotify.com/embed/{kind}/{id}"))
         .send()
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::tools::net_err(&e))?
         .error_for_status()
         .map_err(|_| "Playlist Spotify introuvable ou privée.".to_string())?
         .text()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::tools::net_err(&e))?;
     let data = next_data(&html)?;
     let entity = &data["props"]["pageProps"]["state"]["data"]["entity"];
     let name = entity["name"].as_str().or(entity["title"].as_str()).unwrap_or("Spotify").to_string();
@@ -155,10 +155,10 @@ async fn soundcloud_client_id(http: &reqwest::Client) -> Result<String, String> 
         .get("https://soundcloud.com/")
         .send()
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::tools::net_err(&e))?
         .text()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::tools::net_err(&e))?;
     let re_src = regex::Regex::new(r#"<script[^>]+src="([^"]+)""#).unwrap();
     let re_id = regex::Regex::new(r#"client_id\s*:\s*"([0-9a-zA-Z]{32})""#).unwrap();
     let srcs: Vec<String> = re_src.captures_iter(&home).map(|c| c[1].to_string()).collect();
@@ -177,7 +177,7 @@ async fn sc_get(http: &reqwest::Client, url: &str, client_id: &str) -> Result<Va
     http.get(format!("{url}{sep}client_id={client_id}"))
         .send()
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::tools::net_err(&e))?
         .error_for_status()
         .map_err(|e| match e.status().map(|s| s.as_u16()) {
             Some(404) => "Introuvable sur SoundCloud (lien privé ou supprimé ?).".to_string(),
@@ -185,7 +185,7 @@ async fn sc_get(http: &reqwest::Client, url: &str, client_id: &str) -> Result<Va
         })?
         .json()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| crate::tools::net_err(&e))
 }
 
 fn sc_track(t: &Value) -> Track {
@@ -220,7 +220,7 @@ async fn soundcloud(url: &str) -> Result<Playlist, String> {
     // Short links (on.soundcloud.com) redirect to the real page.
     let mut url = url.split(['?', '#']).next().unwrap_or(url).trim_end_matches('/').to_string();
     if url.contains("on.soundcloud.com") {
-        url = http.get(&url).send().await.map_err(|e| e.to_string())?.url().to_string();
+        url = http.get(&url).send().await.map_err(|e| crate::tools::net_err(&e))?.url().to_string();
         url = url.split('?').next().unwrap_or(&url).trim_end_matches('/').to_string();
     }
     url = url.replace("://m.soundcloud.com", "://soundcloud.com");
@@ -311,12 +311,12 @@ async fn youtube(app: &tauri::AppHandle, url: &str) -> Result<Playlist, String> 
         .stdin(std::process::Stdio::null())
         .output()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::tools::net_err(&e))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!("YouTube : {}", err.lines().last().unwrap_or("lecture impossible")));
     }
-    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| crate::tools::net_err(&e))?;
     let entries: Vec<Value> = match v["entries"].as_array() {
         Some(e) => e.clone(),
         None => vec![v.clone()], // a single video
